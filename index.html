@@ -42,7 +42,7 @@
   };
 </script>
 
-<script type="text/babel" data-presets="react">
+<script type="text/plain" id="app-source">
 const { useState, useEffect, useCallback, useMemo, useRef } = React;
 
 /* ---------------------------------------------------------
@@ -1017,6 +1017,22 @@ if ("serviceWorker" in navigator) {
     navigator.serviceWorker.register("service-worker.js").catch(() => {});
   });
 }
+</script>
+
+<script>
+  // On transforme nous-mêmes le code ci-dessus avec Babel, en forçant le mode
+  // "classic" (React.createElement) plutôt que le nouveau JSX runtime par
+  // défaut, qui génère des instructions "import" incompatibles avec un simple
+  // fichier HTML sans serveur de build.
+  (function () {
+    const source = document.getElementById("app-source").textContent;
+    const output = Babel.transform(source, {
+      presets: [["react", { runtime: "classic" }]],
+    }).code;
+    const script = document.createElement("script");
+    script.textContent = output;
+    document.body.appendChild(script);
+  })();
 </script>
 </body>
 </html>
