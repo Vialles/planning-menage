@@ -19,6 +19,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   html, body, #root { height: 100%; margin: 0; }
   body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
@@ -33,13 +34,17 @@
 ========================================================= -->
 <script>
   window.__FIREBASE_CONFIG__ = {
-    apiKey: "AIzaSyAp8B6671ieUru_Ym16pnIrcLjZ-gWQJZQ",
-    authDomain: "planning-menages.firebaseapp.com",
-    projectId: "planning-menages",
-    storageBucket: "planning-menages.firebasestorage.app",
-    messagingSenderId: "960803640947",
-    appId: "1:960803640947:web:fb1b304883a4b52f52bc06"
+    apiKey: "REMPLACE_MOI",
+    authDomain: "REMPLACE_MOI.firebaseapp.com",
+    projectId: "REMPLACE_MOI",
+    storageBucket: "REMPLACE_MOI.appspot.com",
+    messagingSenderId: "REMPLACE_MOI",
+    appId: "REMPLACE_MOI"
   };
+  // ⚠️ CONFIGURATION GOOGLE AGENDA — à remplir (voir README.md, section
+  // "Synchronisation Google Agenda"). Laisser tel quel désactive juste le
+  // bouton de connexion, le reste de l'appli fonctionne normalement.
+  window.__GOOGLE_CLIENT_ID__ = "REMPLACE_MOI.apps.googleusercontent.com";
 </script>
 
 <script type="text/plain" id="app-source">
@@ -62,8 +67,8 @@ const C = {
 };
 
 const STATUS = {
-  a_faire: { label: "À faire", color: C.terracotta, bg: "#F3DCCF" },
-  en_cours: { label: "En cours", color: C.or, bg: "#F1E3C4" },
+  a_attribuer: { label: "À attribuer", color: C.terracotta, bg: "#F3DCCF" },
+  a_faire: { label: "À faire", color: C.or, bg: "#F1E3C4" },
   termine: { label: "Terminé", color: C.sauge, bg: "#DDE7DF" },
 };
 
@@ -71,6 +76,7 @@ const SOURCES = {
   airbnb: { label: "Airbnb", color: C.rose },
   booking: { label: "Booking", color: C.bleu },
   direct: { label: "Direct", color: C.sauge },
+  hostaway: { label: "Hostaway", color: C.or },
   autre: { label: "Autre", color: C.taupe },
 };
 
@@ -86,15 +92,163 @@ const DEFAULT_CHECKLIST = [
 ];
 
 function uid() { return Math.random().toString(36).slice(2, 10) + Date.now().toString(36); }
-function todayISO() { return new Date().toISOString().slice(0, 10); }
+// Toutes les dates de l'appli sont des chaînes "YYYY-MM-DD". On les convertit
+// TOUJOURS en objets Date locaux (jamais UTC) pour éviter tout décalage lié
+// au fuseau horaire — c'était la cause du bug de dates qui ne correspondaient
+// pas à ce qui avait été saisi.
+function parseISO(iso) {
+  const [y, m, d] = iso.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+function todayISO() {
+  const d = new Date();
+  return isoOf(d.getFullYear(), d.getMonth(), d.getDate());
+}
 function fmtDate(iso) {
-  const d = new Date(iso + "T00:00:00");
-  return d.toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short" });
+  return parseISO(iso).toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "short" });
 }
 function daysInMonth(y, m) { return new Date(y, m + 1, 0).getDate(); }
 function isoOf(y, m, d) {
   return `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 }
+const DAY_LETTERS = ["D", "L", "M", "M", "J", "V", "S"]; // getDay(): 0=dimanche..6=samedi
+function dayLetter(y, m, d) { return DAY_LETTERS[new Date(y, m, d).getDay()]; }
+function isWeekend(y, m, d) { const g = new Date(y, m, d).getDay(); return g === 0 || g === 6; }
+function nightsOverlapISO(checkIn, checkOut, rangeStartISO, rangeEndExclusiveISO) {
+  if (checkOut <= rangeStartISO || checkIn >= rangeEndExclusiveISO) return 0;
+  const start = checkIn < rangeStartISO ? rangeStartISO : checkIn;
+  const end = checkOut > rangeEndExclusiveISO ? rangeEndExclusiveISO : checkOut;
+  return Math.max(0, Math.round((parseISO(end) - parseISO(start)) / 86400000));
+}
+// Quand un ménage passe à "terminé" pour la première fois, un kit de linge
+// propre est automatiquement consommé pour ce logement (propre -> sale).
+async function applyKitConsumption(cleaning, patch, properties, saveProperties) {
+  if (patch.status === "termine" && cleaning.status !== "termine" && !cleaning.kitUsed) {
+    const prop = properties.find((p) => p.id === cleaning.propertyId);
+    if (prop) {
+      const stock = prop.linenStock || { clean: 0, dirty: 0, atLaundry: 0 };
+      const nextStock = { ...stock, clean: Math.max(0, (stock.clean || 0) - 1), dirty: (stock.dirty || 0) + 1 };
+      await saveProperties(properties.map((p) => (p.id === prop.id ? { ...p, linenStock: nextStock } : p)));
+    }
+    return { kitUsed: true };
+  }
+  return {};
+}
+
+// Ajout manuel de linge sale depuis la fiche du ménage — quantité libre,
+// utile pour les logements qui nécessitent plusieurs kits par ménage.
+async function addManualDirtyKit(propertyId, properties, saveProperties, qty) {
+  const n = Math.max(1, qty || 1);
+  const next = properties.map((p) => {
+    if (p.id !== propertyId) return p;
+    const stock = p.linenStock || { clean: 0, dirty: 0, atLaundry: 0 };
+    return { ...p, linenStock: { ...stock, clean: Math.max(0, (stock.clean || 0) - n), dirty: (stock.dirty || 0) + n } };
+  });
+  await saveProperties(next);
+}
+
+// Automatisation : à la fin de chaque séjour (date de départ), un ménage est
+// créé automatiquement pour le logement concerné — pas besoin de le saisir à
+// la main. `sourceReservationId` garde le lien entre le ménage et la
+// réservation qui l'a généré.
+async function createLinkedCleaning(reservation, cleanings, saveCleanings) {
+  const exists = cleanings.some((c) => c.propertyId === reservation.propertyId && c.date === reservation.checkOut);
+  if (exists) return; // déjà un ménage ce jour-là pour ce logement, on ne duplique pas
+  const next = [...cleanings, {
+    id: uid(), propertyId: reservation.propertyId, date: reservation.checkOut, time: "11:00",
+    assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: reservation.id,
+  }];
+  await saveCleanings(next);
+}
+async function syncLinkedCleaning(reservation, cleanings, saveCleanings) {
+  const linked = cleanings.find((c) => c.sourceReservationId === reservation.id);
+  if (!linked) { await createLinkedCleaning(reservation, cleanings, saveCleanings); return; }
+  if (linked.date !== reservation.checkOut || linked.propertyId !== reservation.propertyId) {
+    const clash = cleanings.some((c) => c.id !== linked.id && c.propertyId === reservation.propertyId && c.date === reservation.checkOut);
+    if (!clash) {
+      await saveCleanings(cleanings.map((c) => (c.id === linked.id ? { ...c, date: reservation.checkOut, propertyId: reservation.propertyId } : c)));
+    }
+  }
+}
+async function handleReservationDeleted(reservation, cleanings, saveCleanings) {
+  const linked = cleanings.find((c) => c.sourceReservationId === reservation.id);
+  if (!linked) return;
+  if (linked.status === "a_faire") {
+    // ménage pas encore commencé : on le retire avec la réservation
+    await saveCleanings(cleanings.filter((c) => c.id !== linked.id));
+  } else {
+    // du travail a déjà été fait dessus : on le garde, juste dé-lié
+    await saveCleanings(cleanings.map((c) => (c.id === linked.id ? { ...c, sourceReservationId: null } : c)));
+  }
+}
+// Balaie toutes les réservations existantes et crée les ménages manquants en
+// une seule fois (utile pour rattraper les réservations saisies avant que
+// l'automatisation n'existe).
+async function generateMissingCleanings(reservations, cleanings, saveCleanings) {
+  const next = [...cleanings];
+  let added = 0;
+  for (const r of reservations) {
+    const alreadyLinked = next.some((c) => c.sourceReservationId === r.id);
+    const alreadySameSlot = next.some((c) => c.propertyId === r.propertyId && c.date === r.checkOut);
+    if (!alreadyLinked && !alreadySameSlot) {
+      next.push({ id: uid(), propertyId: r.propertyId, date: r.checkOut, time: "11:00", assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: r.id });
+      added++;
+    }
+  }
+  if (added > 0) await saveCleanings(next);
+  return added;
+}
+
+// ---------------------------------------------------------
+// Import iCal (Hostaway, ou tout autre calendrier .ics standard)
+// ---------------------------------------------------------
+function parseICS(text) {
+  // Les lignes repliées (RFC 5545) commencent par un espace/tabulation : on
+  // les rattache à la ligne précédente avant de découper.
+  const unfolded = text.replace(/\r\n/g, "\n").replace(/\n[ \t]/g, "");
+  const lines = unfolded.split("\n");
+  const events = [];
+  let cur = null;
+  const extractDate = (line) => {
+    const val = line.split(":").pop().trim();
+    const digits = val.replace(/[^0-9]/g, "").slice(0, 8);
+    if (digits.length < 8) return null;
+    return `${digits.slice(0, 4)}-${digits.slice(4, 6)}-${digits.slice(6, 8)}`;
+  };
+  for (const raw of lines) {
+    const line = raw.trim();
+    if (line.startsWith("BEGIN:VEVENT")) cur = {};
+    else if (line.startsWith("END:VEVENT")) { if (cur && cur.dtstart && cur.dtend) events.push(cur); cur = null; }
+    else if (cur) {
+      if (line.startsWith("DTSTART")) cur.dtstart = extractDate(line);
+      else if (line.startsWith("DTEND")) cur.dtend = extractDate(line);
+      else if (line.startsWith("SUMMARY")) cur.summary = line.split(":").slice(1).join(":").trim();
+    }
+  }
+  return events;
+}
+async function syncFromICS(icsText, propertyId, reservations, saveReservations, cleanings, saveCleanings) {
+  const events = parseICS(icsText);
+  const nextRes = [...reservations];
+  const created = [];
+  for (const ev of events) {
+    if (!ev.dtstart || !ev.dtend || ev.dtend <= ev.dtstart) continue;
+    const exists = nextRes.some((r) => r.propertyId === propertyId && r.checkIn === ev.dtstart && r.checkOut === ev.dtend);
+    if (exists) continue;
+    const newRes = {
+      id: uid(), propertyId, guestName: ev.summary && ev.summary !== "Reserved" && ev.summary !== "Blocked" ? ev.summary : "Réservation Hostaway",
+      checkIn: ev.dtstart, checkOut: ev.dtend, source: "hostaway", cleaningPrice: 0, guestPhone: "",
+    };
+    nextRes.push(newRes);
+    created.push(newRes);
+  }
+  if (created.length > 0) {
+    await saveReservations(nextRes);
+    for (const r of created) await createLinkedCleaning(r, cleanings, saveCleanings);
+  }
+  return created.length;
+}
+
 
 /* ---------- minimal inline icon set (no external icon package needed) ---------- */
 function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
@@ -115,8 +269,11 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     alert: "M12 3 2 20h20L12 3Z M12 10v4 M12 17h.01",
     loader: "M12 3v3 M12 18v3 M4.2 4.2l2.1 2.1 M17.7 17.7l2.1 2.1 M3 12h3 M18 12h3 M4.2 19.8l2.1-2.1 M17.7 6.3l2.1-2.1",
     barChart: "M4 20V10 M11 20V4 M18 20v-7",
+    trend: "M3 17l5-5 4 4 8-9 M15 7h5v5",
+    minus: "M5 12h14",
     logOut: "M15 4H6v16h9 M10 12h11 M17 8l4 4-4 4",
     pencil: "M4 20h4L18.5 9.5a2 2 0 0 0-4-4L4 16v4Z",
+    phone: "M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z",
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
@@ -190,6 +347,125 @@ function compressImage(file, maxW = 700, quality = 0.55) {
   });
 }
 
+/* ---------------------------------------------------------
+   GOOGLE AGENDA — synchronisation des ménages assignés
+   Chaque personne connecte SON compte Google (OAuth côté navigateur,
+   aucune clé secrète nécessaire). Les jetons et le carnet de
+   correspondance ménage <-> événement restent uniquement sur cet
+   appareil (localStorage), pas dans Firebase.
+--------------------------------------------------------- */
+const GCAL_SCOPE = "https://www.googleapis.com/auth/calendar.events";
+
+function gcalConfigured() {
+  return window.__GOOGLE_CLIENT_ID__ && !window.__GOOGLE_CLIENT_ID__.startsWith("REMPLACE_MOI") && window.google && window.google.accounts;
+}
+function gcalIsConnected(profileId) {
+  return !!localStorage.getItem(`gcal-connected:${profileId}`);
+}
+function gcalDisconnect(profileId) {
+  localStorage.removeItem(`gcal-token:${profileId}`);
+  localStorage.removeItem(`gcal-connected:${profileId}`);
+  localStorage.removeItem(`gcal-ledger:${profileId}`);
+}
+function gcalLedger(profileId) {
+  try { return JSON.parse(localStorage.getItem(`gcal-ledger:${profileId}`) || "{}"); } catch (e) { return {}; }
+}
+function gcalSaveLedger(profileId, ledger) {
+  localStorage.setItem(`gcal-ledger:${profileId}`, JSON.stringify(ledger));
+}
+function gcalTokenClient(callback) {
+  return google.accounts.oauth2.initTokenClient({ client_id: window.__GOOGLE_CLIENT_ID__, scope: GCAL_SCOPE, callback });
+}
+function gcalConnect(profileId) {
+  return new Promise((resolve, reject) => {
+    if (!gcalConfigured()) { reject(new Error("not-configured")); return; }
+    try {
+      const client = gcalTokenClient((resp) => {
+        if (resp.error) { reject(resp); return; }
+        localStorage.setItem(`gcal-token:${profileId}`, JSON.stringify({ token: resp.access_token, expiresAt: Date.now() + (resp.expires_in - 60) * 1000 }));
+        localStorage.setItem(`gcal-connected:${profileId}`, "1");
+        resolve(resp.access_token);
+      });
+      client.requestAccessToken({ prompt: "consent" });
+    } catch (e) { reject(e); }
+  });
+}
+function gcalGetToken(profileId) {
+  return new Promise((resolve) => {
+    const raw = localStorage.getItem(`gcal-token:${profileId}`);
+    if (raw) {
+      const cached = JSON.parse(raw);
+      if (cached.expiresAt > Date.now()) { resolve(cached.token); return; }
+    }
+    if (!gcalIsConnected(profileId) || !gcalConfigured()) { resolve(null); return; }
+    // Jeton expiré : ré-autorisation silencieuse (déjà accordée précédemment).
+    try {
+      const client = gcalTokenClient((resp) => {
+        if (resp.error) { resolve(null); return; }
+        localStorage.setItem(`gcal-token:${profileId}`, JSON.stringify({ token: resp.access_token, expiresAt: Date.now() + (resp.expires_in - 60) * 1000 }));
+        resolve(resp.access_token);
+      });
+      client.requestAccessToken({ prompt: "" });
+    } catch (e) { resolve(null); }
+  });
+}
+async function gcalApi(method, path, token, body) {
+  const res = await fetch(`https://www.googleapis.com/calendar/v3${path}`, {
+    method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined,
+  });
+  if (method === "DELETE") { if (!res.ok && res.status !== 410 && res.status !== 404) throw new Error("gcal delete failed"); return null; }
+  if (!res.ok) throw new Error("gcal api failed: " + res.status);
+  return res.json();
+}
+function cleaningSignature(c) { return `${c.date}|${c.time}|${c.propertyId}|${c.status}|${c.notes || ""}`; }
+function cleaningToEvent(cleaning, property) {
+  const time = cleaning.time || "11:00";
+  const [h, m] = time.split(":").map(Number);
+  const endH = Math.min(23, h + 2);
+  return {
+    summary: `Ménage — ${property?.name || "Logement"}`,
+    location: property?.address || "",
+    description: `Statut : ${STATUS[cleaning.status]?.label || cleaning.status}${cleaning.notes ? "\n" + cleaning.notes : ""}\nSynchronisé depuis Planning Ménage.`,
+    start: { dateTime: `${cleaning.date}T${time}:00`, timeZone: "Europe/Paris" },
+    end: { dateTime: `${cleaning.date}T${String(endH).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`, timeZone: "Europe/Paris" },
+  };
+}
+// Synchronise TOUS les ménages assignés à cette personne (passés et à venir)
+// vers son Google Agenda personnel. Crée / met à jour / retire les
+// événements en fonction des changements depuis le dernier passage.
+async function syncMyCleanings(profile, cleanings, properties) {
+  const token = await gcalGetToken(profile.id);
+  if (!token) throw new Error("not-connected");
+  const ledger = gcalLedger(profile.id);
+  const mine = cleanings.filter((c) => c.assignedToId === profile.id);
+  let created = 0, updated = 0, removed = 0;
+
+  for (const c of mine) {
+    const sig = cleaningSignature(c);
+    const entry = ledger[c.id];
+    const property = properties.find((p) => p.id === c.propertyId);
+    if (!entry) {
+      const ev = await gcalApi("POST", "/calendars/primary/events", token, cleaningToEvent(c, property));
+      ledger[c.id] = { eventId: ev.id, sig };
+      created++;
+    } else if (entry.sig !== sig) {
+      await gcalApi("PATCH", `/calendars/primary/events/${entry.eventId}`, token, cleaningToEvent(c, property));
+      ledger[c.id] = { eventId: entry.eventId, sig };
+      updated++;
+    }
+  }
+  const mineIds = new Set(mine.map((c) => c.id));
+  for (const cleaningId of Object.keys(ledger)) {
+    if (!mineIds.has(cleaningId)) {
+      await gcalApi("DELETE", `/calendars/primary/events/${ledger[cleaningId].eventId}`, token);
+      delete ledger[cleaningId];
+      removed++;
+    }
+  }
+  gcalSaveLedger(profile.id, ledger);
+  return { created, updated, removed };
+}
+
 /* =========================================================
    APP
 ========================================================= */
@@ -203,6 +479,7 @@ function App() {
   const [tab, setTab] = useState("planning");
   const [error, setError] = useState("");
   const [offline, setOffline] = useState(false);
+  const [showGCal, setShowGCal] = useState(false);
 
   useEffect(() => {
     try {
@@ -281,7 +558,7 @@ function App() {
 
   return (
     <div style={{ background: C.linen, fontFamily: "'Inter', sans-serif" }} className="min-h-screen flex flex-col">
-      <Header profile={profile} onSwitch={switchProfile} offline={offline} />
+      <Header profile={profile} onSwitch={switchProfile} offline={offline} onOpenGCal={() => setShowGCal(true)} />
       {error && (
         <div className="mx-4 mt-3 rounded-lg px-3 py-2 text-sm flex items-center gap-2" style={{ background: "#F3DCCF", color: C.terracotta }}>
           <Icon name="alert" size={16} /><span className="flex-1">{error}</span>
@@ -290,17 +567,23 @@ function App() {
       )}
       <main className="flex-1 overflow-y-auto pb-24 px-4">
         {tab === "planning" && (
-          <PlanningTab profile={profile} team={team} properties={properties} cleanings={cleanings} saveCleanings={saveCleanings} />
+          <PlanningTab profile={profile} team={team} properties={properties} cleanings={cleanings} saveCleanings={saveCleanings} saveProperties={saveProperties} />
         )}
         {tab === "occupation" && (
-          <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} />
+          <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} cleanings={cleanings} saveCleanings={saveCleanings} />
+        )}
+        {tab === "stats" && profile.role === "owner" && (
+          <StatsTab properties={properties} cleanings={cleanings} reservations={reservations} team={team} profile={profile} saveCleanings={saveCleanings} saveProperties={saveProperties} />
         )}
         {tab === "proprietes" && (
-          <ProprietesTab profile={profile} properties={properties} saveProperties={saveProperties} cleanings={cleanings} />
+          <ProprietesTab profile={profile} properties={properties} saveProperties={saveProperties} cleanings={cleanings} saveCleanings={saveCleanings} reservations={reservations} saveReservations={saveReservations} />
         )}
-        {tab === "equipe" && <EquipeTab team={team} profile={profile} />}
+        {tab === "equipe" && <EquipeTab team={team} profile={profile} saveTeam={saveTeam} cleanings={cleanings} saveCleanings={saveCleanings} onSelfDeleted={switchProfile} />}
       </main>
-      <TabBar tab={tab} setTab={setTab} />
+      <TabBar tab={tab} setTab={setTab} role={profile.role} />
+      {showGCal && (
+        <GoogleAgendaPanel profile={profile} cleanings={cleanings} properties={properties} onClose={() => setShowGCal(false)} />
+      )}
     </div>
   );
 }
@@ -355,7 +638,7 @@ function Onboarding({ onDone }) {
 /* =========================================================
    HEADER + TAB BAR
 ========================================================= */
-function Header({ profile, onSwitch, offline }) {
+function Header({ profile, onSwitch, offline, onOpenGCal }) {
   return (
     <header className="px-5 pt-6 pb-4 flex items-center justify-between">
       <div>
@@ -364,17 +647,23 @@ function Header({ profile, onSwitch, offline }) {
         </p>
         <h1 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="text-xl font-semibold">Bonjour, {profile.name}</h1>
       </div>
-      <button onClick={onSwitch} title="Changer de profil" className="rounded-full p-2" style={{ background: C.linenSoft }}>
-        <Icon name="logOut" size={18} color={C.taupe} />
-      </button>
+      <div className="flex items-center gap-2">
+        <button onClick={onOpenGCal} title="Google Agenda" className="rounded-full p-2" style={{ background: gcalIsConnected(profile.id) ? "#DDE7DF" : C.linenSoft }}>
+          <Icon name="calendar" size={18} color={gcalIsConnected(profile.id) ? C.sauge : C.taupe} />
+        </button>
+        <button onClick={onSwitch} title="Changer de profil" className="rounded-full p-2" style={{ background: C.linenSoft }}>
+          <Icon name="logOut" size={18} color={C.taupe} />
+        </button>
+      </div>
     </header>
   );
 }
 
-function TabBar({ tab, setTab }) {
+function TabBar({ tab, setTab, role }) {
   const items = [
     { id: "planning", label: "Ménage", icon: "calendar" },
-    { id: "occupation", label: "Réservations", icon: "barChart" },
+    { id: "occupation", label: "Résa", icon: "barChart" },
+    ...(role === "owner" ? [{ id: "stats", label: "Stats", icon: "trend" }] : []),
     { id: "proprietes", label: "Logements", icon: "home" },
     { id: "equipe", label: "Équipe", icon: "users" },
   ];
@@ -383,9 +672,9 @@ function TabBar({ tab, setTab }) {
       {items.map(({ id, label, icon }) => {
         const active = tab === id;
         return (
-          <button key={id} onClick={() => setTab(id)} className="flex flex-col items-center gap-1 px-3 py-1.5 rounded-xl transition" style={{ color: active ? C.terracotta : C.taupe }}>
-            <Icon name={icon} size={20} strokeWidth={active ? 2.4 : 1.8} />
-            <span className="text-[10.5px] font-medium">{label}</span>
+          <button key={id} onClick={() => setTab(id)} className="flex flex-col items-center gap-1 px-2 py-1.5 rounded-xl transition" style={{ color: active ? C.terracotta : C.taupe }}>
+            <Icon name={icon} size={19} strokeWidth={active ? 2.4 : 1.8} />
+            <span className="text-[10px] font-medium">{label}</span>
           </button>
         );
       })}
@@ -394,19 +683,86 @@ function TabBar({ tab, setTab }) {
 }
 
 /* =========================================================
-   PLANNING (ménage) TAB — inchangé dans l'esprit
+   GOOGLE AGENDA — panneau de connexion et synchronisation
 ========================================================= */
-function PlanningTab({ profile, team, properties, cleanings, saveCleanings }) {
+function GoogleAgendaPanel({ profile, cleanings, properties, onClose }) {
+  const [connected, setConnected] = useState(gcalIsConnected(profile.id));
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState("");
+  const myCount = cleanings.filter((c) => c.assignedToId === profile.id).length;
+
+  const doConnect = async () => {
+    setBusy(true); setMsg("");
+    try {
+      await gcalConnect(profile.id);
+      setConnected(true);
+      const res = await syncMyCleanings(profile, cleanings, properties);
+      setMsg(`Connecté ! ${res.created} événement${res.created > 1 ? "s" : ""} créé${res.created > 1 ? "s" : ""}.`);
+    } catch (e) {
+      if (e?.message === "not-configured") setMsg("La connexion Google Agenda n'est pas encore configurée pour cette appli — voir README.md.");
+      else setMsg("La connexion a échoué ou a été annulée. Réessaie.");
+    }
+    setBusy(false);
+  };
+  const doSync = async () => {
+    setBusy(true); setMsg("");
+    try {
+      const res = await syncMyCleanings(profile, cleanings, properties);
+      setMsg(`Synchronisé : ${res.created} créé${res.created > 1 ? "s" : ""}, ${res.updated} mis à jour, ${res.removed} retiré${res.removed > 1 ? "s" : ""}.`);
+    } catch (e) {
+      setMsg("La synchronisation a échoué. Réessaie, ou reconnecte ton agenda si le problème persiste.");
+    }
+    setBusy(false);
+  };
+  const doDisconnect = () => {
+    gcalDisconnect(profile.id);
+    setConnected(false);
+    setMsg("Déconnecté de cette appli. Tes événements déjà créés restent dans ton agenda.");
+  };
+
+  return (
+    <Sheet onClose={onClose} title="Google Agenda">
+      <p style={{ color: C.taupe }} className="text-sm mb-4">
+        Connecte ton agenda Google personnel : tes {myCount} ménage{myCount !== 1 ? "s" : ""} assigné{myCount !== 1 ? "s" : ""} (passés et à venir) y apparaîtront automatiquement.
+      </p>
+
+      {!connected ? (
+        <button onClick={doConnect} disabled={busy} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+          {busy ? <div className="animate-spin"><Icon name="loader" size={16} /></div> : <Icon name="calendar" size={16} />}
+          Connecter Google Agenda
+        </button>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <div className="flex items-center gap-2 rounded-xl px-3 py-2.5" style={{ background: "#DDE7DF" }}>
+            <Icon name="check" size={14} color={C.sauge} />
+            <span style={{ color: C.sauge }} className="text-sm font-medium">Agenda connecté</span>
+          </div>
+          <button onClick={doSync} disabled={busy} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+            {busy ? <div className="animate-spin"><Icon name="loader" size={16} /></div> : <Icon name="calendar" size={16} />}
+            Synchroniser maintenant
+          </button>
+          <button onClick={doDisconnect} disabled={busy} className="w-full py-2.5 rounded-xl text-sm font-medium disabled:opacity-50" style={{ background: C.linenSoft, color: C.taupe }}>
+            Déconnecter
+          </button>
+        </div>
+      )}
+      {msg && <p style={{ color: C.taupe }} className="text-xs mt-3">{msg}</p>}
+      <p style={{ color: C.taupe }} className="text-xs mt-4">La synchronisation se fait à la demande (bouton ci-dessus), pas en continu en arrière-plan — pense à resynchroniser après des changements importants.</p>
+    </Sheet>
+  );
+}
+function PlanningTab({ profile, team, properties, cleanings, saveCleanings, saveProperties }) {
   const [filter, setFilter] = useState("upcoming");
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
+  const [view, setView] = useState("liste");
 
   const visible = useMemo(() => {
     let list = cleanings;
     if (profile.role === "cleaner") list = list.filter((c) => c.assignedToId === profile.id);
     const today = todayISO();
-    if (filter === "today") list = list.filter((c) => c.date === today);
-    else if (filter === "upcoming") list = list.filter((c) => c.date >= today);
+    if (filter === "today") list = list.filter((c) => c.date === today && c.status !== "termine");
+    else if (filter === "upcoming") list = list.filter((c) => c.date >= today && c.status !== "termine");
     else if (filter === "history") list = list.filter((c) => c.date < today || c.status === "termine");
     return [...list].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
   }, [cleanings, profile, filter]);
@@ -415,6 +771,12 @@ function PlanningTab({ profile, team, properties, cleanings, saveCleanings }) {
   const propertyOf = (id) => properties.find((p) => p.id === id);
   const personOf = (id) => team.find((t) => t.id === id);
   const openCleaning = openId ? cleanings.find((c) => c.id === openId) : null;
+
+  // Le statut se met à jour simplement ; le linge sale se gère désormais
+  // uniquement via le bouton manuel "Ajouter linge sale" dans la fiche.
+  const updateCleaning = async (patch) => {
+    await saveCleanings(cleanings.map((c) => (c.id === openCleaning.id ? { ...c, ...patch } : c)));
+  };
 
   return (
     <div>
@@ -431,30 +793,123 @@ function PlanningTab({ profile, team, properties, cleanings, saveCleanings }) {
               style={{ background: filter === id ? C.ink : C.linenSoft, color: filter === id ? C.linen : C.taupe }}>{label}</button>
           ))}
         </div>
-        {profile.role === "owner" && (
-          <button onClick={() => setShowForm(true)} className="rounded-full p-2" style={{ background: C.ink }}>
-            <Icon name="plus" size={18} color={C.linen} />
+        <div className="flex items-center gap-2">
+          <button onClick={() => setView(view === "liste" ? "gantt" : "liste")} title="Vue planning" className="rounded-full p-2" style={{ background: view === "gantt" ? C.ink : C.linenSoft }}>
+            <Icon name="barChart" size={18} color={view === "gantt" ? C.linen : C.taupe} />
           </button>
-        )}
+          {profile.role === "owner" && (
+            <button onClick={() => setShowForm(true)} className="rounded-full p-2" style={{ background: C.ink }}>
+              <Icon name="plus" size={18} color={C.linen} />
+            </button>
+          )}
+        </div>
       </div>
-      {visible.length === 0 && (
-        <EmptyState icon="calendar" text={profile.role === "owner" ? "Aucun ménage ici. Ajoute-en un avec le bouton +." : "Aucun ménage ne t'est assigné pour l'instant."} />
+      {view === "gantt" && (
+        <MenageGanttChart profile={profile} team={team} properties={properties} cleanings={cleanings} onOpen={setOpenId} />
       )}
-      <div className="flex flex-col gap-3">
-        {visible.map((c) => (
-          <DoorTagCard key={c.id} cleaning={c} property={propertyOf(c.propertyId)} person={personOf(c.assignedToId)} onClick={() => setOpenId(c.id)} />
-        ))}
-      </div>
+      {view === "liste" && (
+        <>
+          {visible.length === 0 && (
+            <EmptyState icon="calendar" text={profile.role === "owner" ? "Aucun ménage ici. Ajoute-en un avec le bouton +." : "Aucun ménage ne t'est assigné pour l'instant."} />
+          )}
+          <div className="flex flex-col gap-3">
+            {visible.map((c) => (
+              <DoorTagCard key={c.id} cleaning={c} property={propertyOf(c.propertyId)} person={personOf(c.assignedToId)} onClick={() => setOpenId(c.id)} />
+            ))}
+          </div>
+        </>
+      )}
       {showForm && (
         <NewCleaningForm properties={properties} team={team} onClose={() => setShowForm(false)}
-          onCreate={async (data) => { await saveCleanings([...cleanings, { id: uid(), status: "a_faire", checklistDone: {}, ...data }]); setShowForm(false); }} />
+          onCreate={async (data) => { await saveCleanings([...cleanings, { id: uid(), status: "a_attribuer", checklistDone: {}, ...data }]); setShowForm(false); }} />
       )}
       {openCleaning && (
-        <CleaningDetail cleaning={openCleaning} property={propertyOf(openCleaning.propertyId)} person={personOf(openCleaning.assignedToId)} profile={profile}
+        <CleaningDetail cleaning={openCleaning} property={propertyOf(openCleaning.propertyId)} properties={properties} saveProperties={saveProperties} team={team} person={personOf(openCleaning.assignedToId)} profile={profile}
           onClose={() => setOpenId(null)}
-          onUpdate={async (patch) => { await saveCleanings(cleanings.map((c) => (c.id === openCleaning.id ? { ...c, ...patch } : c))); }}
+          onUpdate={updateCleaning}
           onDelete={async () => { await saveCleanings(cleanings.filter((c) => c.id !== openCleaning.id)); setOpenId(null); }} />
       )}
+    </div>
+  );
+}
+
+function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
+  const [monthOffset, setMonthOffset] = useState(0);
+  const now = new Date();
+  const base = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
+  const year = base.getFullYear(), month = base.getMonth();
+  const nDays = daysInMonth(year, month);
+  const monthLabel = base.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+  const todayIdx = (now.getFullYear() === year && now.getMonth() === month) ? now.getDate() : null;
+  const dayCols = Array.from({ length: nDays }, (_, i) => i + 1);
+  const monthStartISO = isoOf(year, month, 1);
+  const nextMonthStartISO = isoOf(year, month + 1, 1);
+
+  const visibleCleanings = profile.role === "cleaner" ? cleanings.filter((c) => c.assignedToId === profile.id) : cleanings;
+  const personOf = (id) => team.find((t) => t.id === id);
+
+  if (properties.length === 0) {
+    return <EmptyState icon="home" text="Ajoute un logement pour voir apparaître le planning." />;
+  }
+
+  return (
+    <div className="rounded-2xl overflow-hidden border mb-6" style={{ borderColor: C.taupeLight, background: "#FFFDF8" }}>
+      <div className="flex items-center justify-between px-3 py-2.5">
+        <button onClick={() => setMonthOffset((m) => m - 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronLeft" size={16} color={C.taupe} /></button>
+        <p style={{ color: C.ink, fontFamily: "'Space Grotesk', sans-serif" }} className="text-sm font-semibold capitalize">{monthLabel}</p>
+        <button onClick={() => setMonthOffset((m) => m + 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronRight" size={16} color={C.taupe} /></button>
+      </div>
+      <div className="overflow-x-auto">
+        <div style={{ width: LABEL_W + nDays * DAY_W }}>
+          <div className="flex sticky top-0 z-10" style={{ background: "#FFFDF8" }}>
+            <div style={{ width: LABEL_W, borderColor: C.taupeLight }} className="shrink-0 border-b" />
+            {dayCols.map((d) => {
+              const weekend = isWeekend(year, month, d);
+              const isToday = d === todayIdx;
+              return (
+                <div key={d} style={{ width: DAY_W, background: isToday ? "#F3DCCF" : weekend ? "#00000006" : "transparent" }} className="shrink-0 text-center pt-1 pb-1.5 border-b">
+                  <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[9px] font-semibold leading-none mb-0.5">{dayLetter(year, month, d)}</div>
+                  <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[10px] leading-none">{d}</div>
+                </div>
+              );
+            })}
+          </div>
+          {properties.map((p) => {
+            const cleaningsForP = visibleCleanings.filter((c) => c.propertyId === p.id && c.date >= monthStartISO && c.date < nextMonthStartISO);
+            return (
+              <div key={p.id} className="flex border-b" style={{ borderColor: C.taupeLight }}>
+                <div style={{ width: LABEL_W, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
+                  <span style={{ color: C.ink }} className="text-xs font-medium truncate">{p.name}</span>
+                </div>
+                <div style={{ width: nDays * DAY_W, position: "relative", minHeight: 44 }}>
+                  {dayCols.filter((d) => isWeekend(year, month, d)).map((d) => (
+                    <div key={d} style={{ position: "absolute", left: (d - 1) * DAY_W, top: 0, bottom: 0, width: DAY_W, background: "#00000006" }} />
+                  ))}
+                  {cleaningsForP.map((c) => {
+                    const day = parseISO(c.date).getDate();
+                    const s = STATUS[c.status] || STATUS.a_faire;
+                    const person = personOf(c.assignedToId);
+                    return (
+                      <button key={c.id} onClick={() => onOpen(c.id)} title={`${p.name} · ${person?.name || "Non assigné"} · ${s.label}`}
+                        className="absolute top-2 rounded-md flex items-center justify-center"
+                        style={{ left: (day - 1) * DAY_W + 3, width: DAY_W - 6, height: 26, background: s.color }}>
+                        <span className="text-[10px] font-semibold" style={{ color: "#fff" }}>{(person?.name || "?").charAt(0).toUpperCase()}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+      <div className="flex gap-3 px-3 py-2.5 flex-wrap">
+        {Object.entries(STATUS).map(([k, s]) => (
+          <span key={k} className="flex items-center gap-1.5 text-[11px]" style={{ color: C.taupe }}>
+            <span style={{ width: 8, height: 8, borderRadius: 4, background: s.color, display: "inline-block" }} />{s.label}
+          </span>
+        ))}
+      </div>
     </div>
   );
 }
@@ -473,6 +928,9 @@ function DoorTagCard({ cleaning, property, person, onClick }) {
             <h3 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="font-semibold text-[15px]">{property?.name || "Logement supprimé"}</h3>
             <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: s.bg, color: s.color }}>{s.label}</span>
           </div>
+          {cleaning.sourceReservationId && (
+            <p style={{ color: C.taupe }} className="text-[10.5px] mt-0.5">Généré automatiquement · départ client</p>
+          )}
           <div style={{ color: C.taupe }} className="flex items-center gap-3 text-xs mt-1.5">
             <span className="flex items-center gap-1"><Icon name="calendar" size={12} /> {fmtDate(cleaning.date)}</span>
             <span className="flex items-center gap-1"><Icon name="clock" size={12} /> {cleaning.time}</span>
@@ -488,14 +946,24 @@ function DoorTagCard({ cleaning, property, person, onClick }) {
   );
 }
 
-function NewCleaningForm({ properties, team, onClose, onCreate }) {
-  const [propertyId, setPropertyId] = useState(properties[0]?.id || "");
-  const [date, setDate] = useState(todayISO());
-  const [time, setTime] = useState("11:00");
-  const [assignedToId, setAssignedToId] = useState(team[0]?.id || "");
-  const submit = () => { if (!propertyId) return; onCreate({ propertyId, date, time, assignedToId: assignedToId || null }); };
+function NewCleaningForm({ properties, team, onClose, onCreate, initial }) {
+  const [propertyId, setPropertyId] = useState(initial?.propertyId || properties[0]?.id || "");
+  const [date, setDate] = useState(initial?.date || todayISO());
+  const [time, setTime] = useState(initial?.time || "11:00");
+  const [assignedToId, setAssignedToId] = useState(initial?.assignedToId || team[0]?.id || "");
+  const submit = () => {
+    if (!propertyId) return;
+    const data = { propertyId, date, time, assignedToId: assignedToId || null };
+    if (initial) {
+      // édition : si on vient d'assigner quelqu'un à un ménage encore "à attribuer", il passe automatiquement à "à faire"
+      if (assignedToId && initial.status === "a_attribuer") data.status = "a_faire";
+    } else {
+      data.status = assignedToId ? "a_faire" : "a_attribuer";
+    }
+    onCreate(data);
+  };
   return (
-    <Sheet onClose={onClose} title="Nouveau ménage">
+    <Sheet onClose={onClose} title={initial ? "Modifier le ménage" : "Nouveau ménage"}>
       {properties.length === 0 ? (
         <EmptyState icon="home" text="Ajoute d'abord un logement dans l'onglet Logements." />
       ) : (
@@ -515,18 +983,23 @@ function NewCleaningForm({ properties, team, onClose, onCreate }) {
               {team.map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
             </select>
           </Field>
-          <button onClick={submit} className="w-full py-3 rounded-xl font-medium mt-2" style={{ background: C.ink, color: C.linen }}>Ajouter au planning</button>
+          <button onClick={submit} className="w-full py-3 rounded-xl font-medium mt-2" style={{ background: C.ink, color: C.linen }}>
+            {initial ? "Enregistrer" : "Ajouter au planning"}
+          </button>
         </div>
       )}
     </Sheet>
   );
 }
 
-function CleaningDetail({ cleaning, property, person, profile, onClose, onUpdate, onDelete }) {
+function CleaningDetail({ cleaning, property, properties, saveProperties, team, person, profile, onClose, onUpdate, onDelete }) {
   const [photos, setPhotos] = useState([]);
   const [loadingPhotos, setLoadingPhotos] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [addingKit, setAddingKit] = useState(false);
+  const [dirtyQty, setDirtyQty] = useState(1);
   const [notes, setNotes] = useState(cleaning.notes || "");
+  const [editing, setEditing] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -541,6 +1014,13 @@ function CleaningDetail({ cleaning, property, person, profile, onClose, onUpdate
   const doneCount = checklist.filter((it) => doneMap[it.id]).length;
   const toggleItem = (itemId) => onUpdate({ checklistDone: { ...doneMap, [itemId]: !doneMap[itemId] } });
   const setStatus = (status) => onUpdate({ status });
+
+  if (editing) {
+    return (
+      <NewCleaningForm properties={properties} team={team} initial={cleaning} onClose={() => setEditing(false)}
+        onCreate={async (data) => { await onUpdate(data); setEditing(false); }} />
+    );
+  }
 
   const handlePhoto = async (e) => {
     const file = e.target.files?.[0];
@@ -575,6 +1055,44 @@ function CleaningDetail({ cleaning, property, person, profile, onClose, onUpdate
             style={{ background: cleaning.status === key ? s.color : "transparent", color: cleaning.status === key ? "#fff" : s.color, borderColor: s.color }}>{s.label}</button>
         ))}
       </div>
+      {property && (
+        <div className="mb-5">
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Linge de ce logement</p>
+          <div className="flex gap-2">
+            {[
+              ["Propre", property.linenStock?.clean || 0, C.sauge],
+              ["Sale", property.linenStock?.dirty || 0, C.terracotta],
+              ["Blanchisserie", property.linenStock?.atLaundry || 0, C.or],
+            ].map(([label, val, color]) => (
+              <div key={label} className="flex-1 rounded-xl px-2 py-2 text-center" style={{ background: C.linenSoft }}>
+                <p style={{ color, fontFamily: "'IBM Plex Mono', monospace" }} className="text-base font-semibold">{val}</p>
+                <p style={{ color: C.taupe }} className="text-[10px]">{label}</p>
+              </div>
+            ))}
+          </div>
+          {!property.linenStock?.clean && (
+            <p style={{ color: C.terracotta }} className="text-xs mt-1.5">Aucun kit propre disponible pour ce logement actuellement.</p>
+          )}
+          <div className="flex items-center justify-center gap-3 mt-2">
+            <button onClick={() => setDirtyQty((q) => Math.max(1, q - 1))} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: C.linenSoft }}>
+              <Icon name="minus" size={12} color={C.taupe} />
+            </button>
+            <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: C.ink }} className="w-6 text-center text-sm">{dirtyQty}</span>
+            <button onClick={() => setDirtyQty((q) => q + 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: C.linenSoft }}>
+              <Icon name="plus" size={12} color={C.taupe} />
+            </button>
+          </div>
+          <button
+            onClick={async () => { setAddingKit(true); await addManualDirtyKit(property.id, properties, saveProperties, dirtyQty); setAddingKit(false); setDirtyQty(1); }}
+            disabled={addingKit}
+            className="w-full mt-2 py-2 rounded-xl text-xs font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.linenSoft, color: C.ink }}>
+            {addingKit ? <div className="animate-spin"><Icon name="loader" size={13} color={C.taupe} /></div> : <Icon name="plus" size={13} color={C.taupe} />}
+            Ajouter {dirtyQty > 1 ? `${dirtyQty} kits sales` : "linge sale"}
+          </button>
+          <p style={{ color: C.taupe }} className="text-xs mt-1.5">Le reste du stock se gère dans la fiche du logement (onglet Logements).</p>
+        </div>
+      )}
+
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Checklist ({doneCount}/{checklist.length})</p>
       <div className="flex flex-col gap-2 mb-5">
         {checklist.length === 0 && <p style={{ color: C.taupe }} className="text-sm">Ce logement n'a pas encore de checklist.</p>}
@@ -608,9 +1126,14 @@ function CleaningDetail({ cleaning, property, person, profile, onClose, onUpdate
       <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. clé sous le pot, interphone en panne…" rows={3}
         className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
       {profile.role === "owner" && (
-        <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: "#F3DCCF", color: C.terracotta }}>
-          <Icon name="trash" size={15} /> Supprimer ce ménage
-        </button>
+        <div className="flex flex-col gap-2">
+          <button onClick={() => setEditing(true)} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: C.linenSoft, color: C.ink }}>
+            <Icon name="pencil" size={15} /> Modifier ce ménage
+          </button>
+          <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: "#F3DCCF", color: C.terracotta }}>
+            <Icon name="trash" size={15} /> Supprimer ce ménage
+          </button>
+        </div>
       )}
     </Sheet>
   );
@@ -622,10 +1145,20 @@ function CleaningDetail({ cleaning, property, person, profile, onClose, onUpdate
 const DAY_W = 30;
 const LABEL_W = 108;
 
-function OccupationTab({ profile, properties, reservations, saveReservations }) {
+function OccupationTab({ profile, properties, reservations, saveReservations, cleanings, saveCleanings }) {
   const [monthOffset, setMonthOffset] = useState(0);
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
+  const [generating, setGenerating] = useState(false);
+  const [genMsg, setGenMsg] = useState("");
+
+  const runGenerateMissing = async () => {
+    setGenerating(true);
+    setGenMsg("");
+    const added = await generateMissingCleanings(reservations, cleanings, saveCleanings);
+    setGenerating(false);
+    setGenMsg(added > 0 ? `${added} ménage${added > 1 ? "s" : ""} créé${added > 1 ? "s" : ""}.` : "Tout est déjà à jour.");
+  };
 
   const now = new Date();
   const base = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
@@ -645,7 +1178,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations }) 
     if (co <= monthStartISO || ci >= nextMonthStartISO) return 0;
     const start = ci < monthStartISO ? monthStartISO : ci;
     const end = co > nextMonthStartISO ? nextMonthStartISO : co;
-    return Math.max(0, Math.round((new Date(end) - new Date(start)) / 86400000));
+    return Math.max(0, Math.round((parseISO(end) - parseISO(start)) / 86400000));
   };
 
   const occupancy = useMemo(() => {
@@ -661,8 +1194,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations }) 
   const pctColor = (pct) => (pct < 40 ? C.terracotta : pct < 70 ? C.or : C.sauge);
 
   const dayIndexClamped = (iso) => {
-    const d = new Date(iso);
-    const idx = Math.round((d - new Date(year, month, 1)) / 86400000) + 1;
+    const idx = Math.round((parseISO(iso) - new Date(year, month, 1)) / 86400000) + 1;
     return Math.max(1, Math.min(nDays + 1, idx));
   };
 
@@ -678,6 +1210,17 @@ function OccupationTab({ profile, properties, reservations, saveReservations }) 
           </button>
         )}
       </div>
+
+      {profile.role === "owner" && (
+        <div className="mb-4">
+          <button onClick={runGenerateMissing} disabled={generating}
+            className="text-xs font-medium px-3 py-2 rounded-xl flex items-center gap-2 disabled:opacity-60" style={{ background: C.linenSoft, color: C.ink }}>
+            {generating ? <div className="animate-spin"><Icon name="loader" size={14} color={C.taupe} /></div> : <Icon name="calendar" size={14} color={C.taupe} />}
+            Générer les ménages manquants
+          </button>
+          {genMsg && <p style={{ color: C.sauge }} className="text-xs mt-1.5">{genMsg}</p>}
+        </div>
+      )}
 
       {/* Résumé taux de remplissage */}
       {properties.length > 0 && (
@@ -718,33 +1261,74 @@ function OccupationTab({ profile, properties, reservations, saveReservations }) 
             <div style={{ width: LABEL_W + nDays * DAY_W }}>
               {/* header jours */}
               <div className="flex sticky top-0 z-10" style={{ background: "#FFFDF8" }}>
-                <div style={{ width: LABEL_W }} className="shrink-0 border-b" style={{ borderColor: C.taupeLight }} />
-                {dayCols.map((d) => (
-                  <div key={d} style={{ width: DAY_W, background: d === todayIdx ? "#F3DCCF" : "transparent" }}
-                    className="shrink-0 text-center py-1.5 border-b text-[10px]" >
-                    <span style={{ color: d === todayIdx ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }}>{d}</span>
-                  </div>
-                ))}
+                <div style={{ width: LABEL_W, borderColor: C.taupeLight }} className="shrink-0 border-b" />
+                {dayCols.map((d) => {
+                  const weekend = isWeekend(year, month, d);
+                  const isToday = d === todayIdx;
+                  return (
+                    <div key={d} style={{ width: DAY_W, background: isToday ? "#F3DCCF" : weekend ? "#00000006" : "transparent" }}
+                      className="shrink-0 text-center pt-1 pb-1.5 border-b" >
+                      <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[9px] font-semibold leading-none mb-0.5">
+                        {dayLetter(year, month, d)}
+                      </div>
+                      <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[10px] leading-none">
+                        {d}
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
               {/* lignes logements */}
               {properties.map((p) => {
                 const resForP = reservations.filter((r) => r.propertyId === p.id && r.checkOut > monthStartISO && r.checkIn <= monthEndISO);
+                // Jours de rotation : un client part ET un autre arrive le même
+                // jour sur ce logement — cas à repérer en priorité pour
+                // organiser le ménage (délai très serré entre les deux).
+                const checkoutDays = new Set(resForP.map((r) => r.checkOut));
+                const turnoverDays = resForP.map((r) => r.checkIn).filter((d) => checkoutDays.has(d) && d >= monthStartISO && d <= monthEndISO);
                 return (
                   <div key={p.id} className="flex border-b" style={{ borderColor: C.taupeLight }}>
                     <div style={{ width: LABEL_W, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
                       <span style={{ color: C.ink }} className="text-xs font-medium truncate">{p.name}</span>
                     </div>
                     <div style={{ width: nDays * DAY_W, position: "relative", minHeight: 44 }}>
+                      {dayCols.filter((d) => isWeekend(year, month, d)).map((d) => (
+                        <div key={d} style={{ position: "absolute", left: (d - 1) * DAY_W, top: 0, bottom: 0, width: DAY_W, background: "#00000006" }} />
+                      ))}
+                      {turnoverDays.map((d) => {
+                        const day = parseISO(d).getDate();
+                        return (
+                          <div key={"turnover-" + d} title="Départ et arrivée le même jour — ménage à organiser entre les deux"
+                            className="absolute top-0 bottom-0 pointer-events-none" style={{ left: (day - 1) * DAY_W, width: DAY_W, zIndex: 5 }}>
+                            <div className="w-full h-full" style={{ background: `repeating-linear-gradient(45deg, ${C.terracotta}33, ${C.terracotta}33 4px, transparent 4px, transparent 8px)`, borderLeft: `2px dashed ${C.terracotta}`, borderRight: `2px dashed ${C.terracotta}` }} />
+                            <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 rounded-full flex items-center justify-center" style={{ width: 14, height: 14, background: C.terracotta }}>
+                              <Icon name="alert" size={9} color="#fff" />
+                            </div>
+                          </div>
+                        );
+                      })}
                       {resForP.map((r) => {
                         const startCol = dayIndexClamped(r.checkIn < monthStartISO ? monthStartISO : r.checkIn);
                         const endCol = dayIndexClamped(r.checkOut > isoOf(year, month + 1, 1) ? isoOf(year, month + 1, 1) : r.checkOut);
                         const src = SOURCES[r.source] || SOURCES.autre;
+                        // Le jour de départ n'est pas une nuit réservée, mais on le
+                        // colore quand même (teinte plus claire) pour signaler que
+                        // le client part ce jour-là — utile pour repérer les jours
+                        // de rotation entre deux séjours.
+                        const departureVisible = r.checkOut <= monthEndISO && r.checkOut >= monthStartISO;
                         return (
-                          <button key={r.id} onClick={() => setOpenId(r.id)}
-                            className="absolute top-2 rounded-md text-left px-1.5 flex items-center overflow-hidden"
-                            style={{ left: (startCol - 1) * DAY_W + 2, width: Math.max(DAY_W - 4, (endCol - startCol) * DAY_W - 4), height: 26, background: src.color }}>
-                            <span className="text-[10px] font-medium truncate" style={{ color: "#fff" }}>{r.guestName}</span>
-                          </button>
+                          <React.Fragment key={r.id}>
+                            <button onClick={() => setOpenId(r.id)}
+                              className="absolute top-2 rounded-md text-left px-1.5 flex items-center overflow-hidden"
+                              style={{ left: (startCol - 1) * DAY_W + 2, width: Math.max(DAY_W - 4, (endCol - startCol) * DAY_W - 4), height: 26, background: src.color }}>
+                              <span className="text-[10px] font-medium truncate" style={{ color: "#fff" }}>{r.guestName}</span>
+                            </button>
+                            {departureVisible && (
+                              <div onClick={() => setOpenId(r.id)} title="Jour de départ"
+                                className="absolute top-2 rounded-md cursor-pointer"
+                                style={{ left: (endCol - 1) * DAY_W + 2, width: DAY_W - 4, height: 26, background: src.color, opacity: 0.35 }} />
+                            )}
+                          </React.Fragment>
                         );
                       })}
                     </div>
@@ -759,19 +1343,37 @@ function OccupationTab({ profile, properties, reservations, saveReservations }) 
                 <span style={{ width: 8, height: 8, borderRadius: 4, background: s.color, display: "inline-block" }} />{s.label}
               </span>
             ))}
+            <span className="flex items-center gap-1.5 text-[11px]" style={{ color: C.terracotta }}>
+              <Icon name="alert" size={11} color={C.terracotta} />Rotation même jour
+            </span>
           </div>
         </div>
       )}
 
       {showForm && (
         <ReservationForm properties={properties} onClose={() => setShowForm(false)}
-          onCreate={async (data) => { await saveReservations([...reservations, { id: uid(), ...data }]); setShowForm(false); }} />
+          onCreate={async (data) => {
+            const duplicate = reservations.some((r) => r.propertyId === data.propertyId && r.guestName === data.guestName && r.checkIn === data.checkIn && r.checkOut === data.checkOut);
+            if (duplicate) { setShowForm(false); return; }
+            const newRes = { id: uid(), ...data };
+            await saveReservations([...reservations, newRes]);
+            await createLinkedCleaning(newRes, cleanings, saveCleanings);
+            setShowForm(false);
+          }} />
       )}
       {openReservation && (
         <ReservationDetail reservation={openReservation} property={properties.find((p) => p.id === openReservation.propertyId)} profile={profile}
           onClose={() => setOpenId(null)}
-          onUpdate={async (patch) => { await saveReservations(reservations.map((r) => (r.id === openReservation.id ? { ...r, ...patch } : r))); }}
-          onDelete={async () => { await saveReservations(reservations.filter((r) => r.id !== openReservation.id)); setOpenId(null); }} />
+          onUpdate={async (patch) => {
+            const updated = { ...openReservation, ...patch };
+            await saveReservations(reservations.map((r) => (r.id === openReservation.id ? updated : r)));
+            await syncLinkedCleaning(updated, cleanings, saveCleanings);
+          }}
+          onDelete={async () => {
+            await handleReservationDeleted(openReservation, cleanings, saveCleanings);
+            await saveReservations(reservations.filter((r) => r.id !== openReservation.id));
+            setOpenId(null);
+          }} />
       )}
     </div>
   );
@@ -783,10 +1385,17 @@ function ReservationForm({ properties, onClose, onCreate, initial }) {
   const [checkIn, setCheckIn] = useState(initial?.checkIn || todayISO());
   const [checkOut, setCheckOut] = useState(initial?.checkOut || todayISO());
   const [source, setSource] = useState(initial?.source || "airbnb");
+  const [cleaningPrice, setCleaningPrice] = useState(initial?.cleaningPrice ? String(initial.cleaningPrice) : "");
+  const [guestPhone, setGuestPhone] = useState(initial?.guestPhone || "");
+  const [submitting, setSubmitting] = useState(false);
 
-  const submit = () => {
-    if (!propertyId || !guestName.trim() || checkOut <= checkIn) return;
-    onCreate({ propertyId, guestName: guestName.trim(), checkIn, checkOut, source });
+  const submit = async () => {
+    if (!propertyId || !guestName.trim() || checkOut <= checkIn || submitting) return;
+    setSubmitting(true);
+    await onCreate({ propertyId, guestName: guestName.trim(), checkIn, checkOut, source, cleaningPrice: Number(cleaningPrice) || 0, guestPhone: guestPhone.trim() });
+    // pas de setSubmitting(false) ici : la fiche se ferme juste après (onCreate
+    // déclenche la fermeture côté parent) — remettre à false provoquerait un
+    // réaffichage du bouton actif pendant l'instant de la fermeture.
   };
 
   return (
@@ -803,6 +1412,9 @@ function ReservationForm({ properties, onClose, onCreate, initial }) {
           <Field label="Nom du client">
             <input value={guestName} onChange={(e) => setGuestName(e.target.value)} placeholder="Ex. Famille Dupont" style={selectStyle} />
           </Field>
+          <Field label="Téléphone (optionnel)">
+            <input type="tel" value={guestPhone} onChange={(e) => setGuestPhone(e.target.value)} placeholder="Ex. 06 12 34 56 78" style={selectStyle} />
+          </Field>
           <div className="grid grid-cols-2 gap-3">
             <Field label="Arrivée"><input type="date" value={checkIn} onChange={(e) => setCheckIn(e.target.value)} style={selectStyle} /></Field>
             <Field label="Départ"><input type="date" value={checkOut} onChange={(e) => setCheckOut(e.target.value)} style={selectStyle} /></Field>
@@ -816,7 +1428,11 @@ function ReservationForm({ properties, onClose, onCreate, initial }) {
               ))}
             </div>
           </Field>
-          <button onClick={submit} disabled={!guestName.trim() || checkOut <= checkIn} className="w-full py-3 rounded-xl font-medium mt-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+          <Field label="Prix du ménage (optionnel, pour les statistiques)">
+            <input type="number" min="0" step="0.01" value={cleaningPrice} onChange={(e) => setCleaningPrice(e.target.value)} placeholder="Ex. 60" style={selectStyle} />
+          </Field>
+          <button onClick={submit} disabled={!guestName.trim() || checkOut <= checkIn || submitting} className="w-full py-3 rounded-xl font-medium mt-2 disabled:opacity-50 flex items-center justify-center gap-2" style={{ background: C.ink, color: C.linen }}>
+            {submitting && <div className="animate-spin"><Icon name="loader" size={16} /></div>}
             {initial ? "Enregistrer" : "Ajouter la réservation"}
           </button>
         </div>
@@ -827,7 +1443,7 @@ function ReservationForm({ properties, onClose, onCreate, initial }) {
 
 function ReservationDetail({ reservation, property, profile, onClose, onUpdate, onDelete }) {
   const [editing, setEditing] = useState(false);
-  const nights = Math.round((new Date(reservation.checkOut) - new Date(reservation.checkIn)) / 86400000);
+  const nights = Math.round((parseISO(reservation.checkOut) - parseISO(reservation.checkIn)) / 86400000);
   const src = SOURCES[reservation.source] || SOURCES.autre;
 
   if (editing) {
@@ -851,7 +1467,15 @@ function ReservationDetail({ reservation, property, profile, onClose, onUpdate, 
         <span className="flex items-center gap-1.5"><Icon name="calendar" size={14} color={C.taupe} />Départ</span>
         <span>{fmtDate(reservation.checkOut)}</span>
       </div>
-      <p style={{ color: C.taupe }} className="text-xs mb-5">{nights} nuit{nights > 1 ? "s" : ""}</p>
+      {reservation.guestPhone && (
+        <a href={`tel:${reservation.guestPhone}`} className="flex items-center justify-between text-sm mb-4 rounded-xl px-3 py-2.5" style={{ background: C.linenSoft }}>
+          <span className="flex items-center gap-1.5" style={{ color: C.ink }}><Icon name="phone" size={14} color={C.taupe} />{reservation.guestPhone}</span>
+          <span style={{ color: C.sauge }} className="text-xs font-semibold">Appeler</span>
+        </a>
+      )}
+      <p style={{ color: C.taupe }} className="text-xs mb-5">
+        {nights} nuit{nights > 1 ? "s" : ""}{reservation.cleaningPrice ? ` · ménage : ${reservation.cleaningPrice} €` : ""}
+      </p>
 
       {profile.role === "owner" && (
         <div className="flex flex-col gap-2">
@@ -870,7 +1494,7 @@ function ReservationDetail({ reservation, property, profile, onClose, onUpdate, 
 /* =========================================================
    PROPRIÉTÉS TAB
 ========================================================= */
-function ProprietesTab({ profile, properties, saveProperties, cleanings }) {
+function ProprietesTab({ profile, properties, saveProperties, cleanings, saveCleanings, reservations, saveReservations }) {
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
   const openProperty = openId ? properties.find((p) => p.id === openId) : null;
@@ -901,13 +1525,34 @@ function ProprietesTab({ profile, properties, saveProperties, cleanings }) {
       </div>
       {showForm && (
         <PropertyForm onClose={() => setShowForm(false)}
-          onCreate={async (data) => { await saveProperties([...properties, { id: uid(), ...data, checklist: DEFAULT_CHECKLIST.map((text) => ({ id: uid(), text })) }]); setShowForm(false); }} />
+          onCreate={async (data) => { await saveProperties([...properties, { id: uid(), ...data, checklist: DEFAULT_CHECKLIST.map((text) => ({ id: uid(), text })), linenStock: { clean: 0, dirty: 0, atLaundry: 0 }, kitPrice: 15 }]); setShowForm(false); }} />
       )}
       {openProperty && (
-        <PropertyDetail property={openProperty} profile={profile} onClose={() => setOpenId(null)}
+        <PropertyDetail property={openProperty} profile={profile} cleanings={cleanings} saveCleanings={saveCleanings} reservations={reservations} saveReservations={saveReservations} onClose={() => setOpenId(null)}
           onUpdate={async (patch) => { await saveProperties(properties.map((p) => (p.id === openProperty.id ? { ...p, ...patch } : p))); }}
           onDelete={async () => { await saveProperties(properties.filter((p) => p.id !== openProperty.id)); setOpenId(null); }} />
       )}
+    </div>
+  );
+}
+
+function Stepper({ label, value, onChange, color, readOnly }) {
+  return (
+    <div className="flex items-center justify-between py-1.5">
+      <span style={{ color: C.ink }} className="text-sm">{label}</span>
+      <div className="flex items-center gap-2.5">
+        {!readOnly && (
+          <button onClick={() => onChange(Math.max(0, value - 1))} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: C.linenSoft }}>
+            <Icon name="minus" size={14} color={C.taupe} />
+          </button>
+        )}
+        <span style={{ color: color || C.ink, fontFamily: "'IBM Plex Mono', monospace", minWidth: 22 }} className="text-sm font-semibold text-center">{value}</span>
+        {!readOnly && (
+          <button onClick={() => onChange(value + 1)} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: C.linenSoft }}>
+            <Icon name="plus" size={14} color={C.taupe} />
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -927,15 +1572,123 @@ function PropertyForm({ onClose, onCreate }) {
   );
 }
 
-function PropertyDetail({ property, profile, onClose, onUpdate, onDelete }) {
+function PropertyDetail({ property, profile, cleanings, saveCleanings, reservations, saveReservations, onClose, onUpdate, onDelete }) {
   const [newItem, setNewItem] = useState("");
+  const [notes, setNotes] = useState(property.notes || "");
+  const [kitPrice, setKitPrice] = useState(property.kitPrice != null ? String(property.kitPrice) : "15");
+  const [icalUrl, setIcalUrl] = useState(property.icalUrl || "");
+  const [icsPaste, setIcsPaste] = useState("");
+  const [syncing, setSyncing] = useState(false);
+  const [syncMsg, setSyncMsg] = useState("");
   const isOwner = profile.role === "owner";
   const addItem = () => { if (!newItem.trim()) return; onUpdate({ checklist: [...property.checklist, { id: uid(), text: newItem.trim() }] }); setNewItem(""); };
   const removeItem = (id) => onUpdate({ checklist: property.checklist.filter((i) => i.id !== id) });
+  const saveNotes = () => onUpdate({ notes });
+  const saveKitPrice = () => onUpdate({ kitPrice: Number(kitPrice) || 0 });
+  const saveIcalUrl = () => onUpdate({ icalUrl: icalUrl.trim() });
+
+  const runSync = async () => {
+    if (!icalUrl.trim()) return;
+    setSyncing(true);
+    setSyncMsg("");
+    try {
+      const res = await fetch(icalUrl.trim());
+      if (!res.ok) throw new Error("http");
+      const text = await res.text();
+      const count = await syncFromICS(text, property.id, reservations, saveReservations, cleanings, saveCleanings);
+      setSyncMsg(count > 0 ? `${count} réservation${count > 1 ? "s" : ""} importée${count > 1 ? "s" : ""}.` : "Aucune nouvelle réservation à importer.");
+    } catch (err) {
+      setSyncMsg("Synchronisation automatique impossible depuis le navigateur (souvent bloquée par le site source). Utilise le collage manuel juste en dessous à la place.");
+    }
+    setSyncing(false);
+  };
+  const runPasteImport = async () => {
+    if (!icsPaste.trim()) return;
+    setSyncing(true);
+    setSyncMsg("");
+    const count = await syncFromICS(icsPaste, property.id, reservations, saveReservations, cleanings, saveCleanings);
+    setSyncMsg(count > 0 ? `${count} réservation${count > 1 ? "s" : ""} importée${count > 1 ? "s" : ""}.` : "Aucune nouvelle réservation trouvée dans ce texte.");
+    setSyncing(false);
+    setIcsPaste("");
+  };
+
+  const stock = property.linenStock || { clean: 0, dirty: 0, atLaundry: 0 };
+  const updateStock = (patch) => onUpdate({ linenStock: { ...stock, ...patch } });
+  const [resolveQty, setResolveQty] = useState(1);
+  const clampedQty = Math.max(1, Math.min(resolveQty, stock.dirty || 1));
+  const sendToLaundry = (qty) => {
+    const n = Math.min(qty, stock.dirty || 0);
+    if (n <= 0) return;
+    const log = [...(property.laundryLog || []), { date: todayISO(), count: n }];
+    onUpdate({ linenStock: { ...stock, dirty: (stock.dirty || 0) - n, atLaundry: (stock.atLaundry || 0) + n }, laundryLog: log });
+    setResolveQty(1);
+  };
+  const washOurselves = (qty) => {
+    const n = Math.min(qty, stock.dirty || 0);
+    if (n <= 0) return;
+    const log = [...(property.selfWashLog || []), { date: todayISO(), count: n }];
+    onUpdate({ linenStock: { ...stock, dirty: (stock.dirty || 0) - n, clean: (stock.clean || 0) + n }, selfWashLog: log });
+    setResolveQty(1);
+  };
+  const receiveClean = () => updateStock({ atLaundry: 0, clean: (stock.clean || 0) + (stock.atLaundry || 0) });
+
   return (
     <Sheet onClose={onClose} title={property.name}>
       {property.address && <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-5"><Icon name="mapPin" size={14} /> {property.address}</p>}
-      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Checklist de ménage</p>
+
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Info importante</p>
+      {isOwner ? (
+        <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. code portail 1234B, wifi: xxxx, chaudière capricieuse…" rows={2}
+          className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
+      ) : (
+        <p style={{ color: C.ink, background: C.linenSoft }} className="text-sm rounded-xl px-3 py-2 mb-5">
+          {property.notes || <span style={{ color: C.taupe }}>Aucune info particulière.</span>}
+        </p>
+      )}
+
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Stock de linge</p>
+      <div className="rounded-xl px-3 py-1 mb-3" style={{ background: C.linenSoft }}>
+        <Stepper label="Propre" value={stock.clean || 0} onChange={(v) => updateStock({ clean: v })} color={C.sauge} readOnly={!isOwner} />
+        <div className="border-t" style={{ borderColor: C.taupeLight }} />
+        <Stepper label="Sale" value={stock.dirty || 0} onChange={(v) => updateStock({ dirty: v })} color={C.terracotta} readOnly={!isOwner} />
+        <div className="border-t" style={{ borderColor: C.taupeLight }} />
+        <Stepper label="En blanchisserie" value={stock.atLaundry || 0} onChange={(v) => updateStock({ atLaundry: v })} color={C.or} readOnly={!isOwner} />
+      </div>
+      {isOwner && (
+        <div className="mb-3">
+          <div className="flex items-center justify-between mb-2">
+            <span style={{ color: C.taupe }} className="text-xs">Quantité de linge sale à traiter</span>
+            <div className="flex items-center gap-2">
+              <button onClick={() => setResolveQty((q) => Math.max(1, q - 1))} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: C.linenSoft }}>
+                <Icon name="minus" size={12} color={C.taupe} />
+              </button>
+              <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: C.ink }} className="w-6 text-center text-sm">{clampedQty}</span>
+              <button onClick={() => setResolveQty((q) => Math.min(stock.dirty || 1, q + 1))} className="w-7 h-7 rounded-full flex items-center justify-center" style={{ background: C.linenSoft }}>
+                <Icon name="plus" size={12} color={C.taupe} />
+              </button>
+            </div>
+          </div>
+          <div className="grid grid-cols-2 gap-2 mb-2">
+            <button onClick={() => sendToLaundry(clampedQty)} disabled={!stock.dirty} className="py-2 rounded-lg text-xs font-medium disabled:opacity-40" style={{ background: C.linenSoft, color: C.ink }}>
+              Envoyer en blanchisserie
+            </button>
+            <button onClick={() => washOurselves(clampedQty)} disabled={!stock.dirty} className="py-2 rounded-lg text-xs font-medium disabled:opacity-40" style={{ background: C.linenSoft, color: C.ink }}>
+              Laver par nous-même
+            </button>
+          </div>
+          <button onClick={receiveClean} disabled={!stock.atLaundry} className="w-full py-2 rounded-lg text-xs font-medium disabled:opacity-40" style={{ background: C.linenSoft, color: C.ink }}>
+            Récupérer le propre (retour blanchisserie)
+          </button>
+        </div>
+      )}
+      <p style={{ color: C.taupe }} className="text-xs mb-2">Le linge lavé par nous-même retourne directement dans le stock propre. Seuls les kits envoyés en blanchisserie sont comptés dans le montant à facturer (page Statistiques).</p>
+      {isOwner && (
+        <Field label="Prix facturé par kit de linge utilisé (€)">
+          <input type="number" min="0" step="0.5" value={kitPrice} onChange={(e) => setKitPrice(e.target.value)} onBlur={saveKitPrice} style={selectStyle} />
+        </Field>
+      )}
+
+      <p style={{ color: C.ink, marginTop: 20 }} className="text-sm font-semibold mb-2">Checklist de ménage</p>
       <div className="flex flex-col gap-2 mb-3">
         {property.checklist.map((item) => (
           <div key={item.id} className="flex items-center justify-between px-3 py-2 rounded-xl" style={{ background: C.linenSoft }}>
@@ -945,15 +1698,39 @@ function PropertyDetail({ property, profile, onClose, onUpdate, onDelete }) {
         ))}
       </div>
       {isOwner && (
-        <>
-          <div className="flex gap-2 mb-6">
-            <input value={newItem} onChange={(e) => setNewItem(e.target.value)} placeholder="Ajouter une tâche" className="flex-1 px-3 py-2 rounded-xl text-sm outline-none" style={{ background: C.linenSoft, color: C.ink }} onKeyDown={(e) => e.key === "Enter" && addItem()} />
-            <button onClick={addItem} className="px-4 rounded-xl" style={{ background: C.ink }}><Icon name="plus" size={16} color={C.linen} /></button>
+        <div className="flex gap-2 mb-6">
+          <input value={newItem} onChange={(e) => setNewItem(e.target.value)} placeholder="Ajouter une tâche" className="flex-1 px-3 py-2 rounded-xl text-sm outline-none" style={{ background: C.linenSoft, color: C.ink }} onKeyDown={(e) => e.key === "Enter" && addItem()} />
+          <button onClick={addItem} className="px-4 rounded-xl" style={{ background: C.ink }}><Icon name="plus" size={16} color={C.linen} /></button>
+        </div>
+      )}
+
+      {isOwner && (
+        <div className="mb-5">
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Synchronisation réservations (Hostaway / iCal)</p>
+          <div className="flex gap-2 mb-2">
+            <input value={icalUrl} onChange={(e) => setIcalUrl(e.target.value)} onBlur={saveIcalUrl} placeholder="Lien iCal Hostaway (optionnel)" className="flex-1" style={selectStyle} />
           </div>
-          <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: "#F3DCCF", color: C.terracotta }}>
-            <Icon name="trash" size={15} /> Supprimer ce logement
+          <button onClick={runSync} disabled={!icalUrl.trim() || syncing} className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: C.linenSoft, color: C.ink }}>
+            {syncing ? <div className="animate-spin"><Icon name="loader" size={14} color={C.taupe} /></div> : <Icon name="calendar" size={14} color={C.taupe} />}
+            Synchroniser maintenant
           </button>
-        </>
+          <details className="mb-1">
+            <summary style={{ color: C.taupe }} className="text-xs cursor-pointer select-none">La synchronisation automatique ne fonctionne pas ? Coller le calendrier manuellement</summary>
+            <textarea value={icsPaste} onChange={(e) => setIcsPaste(e.target.value)} placeholder="Colle ici le contenu du fichier .ics (BEGIN:VCALENDAR...)" rows={3}
+              className="w-full px-3 py-2 rounded-xl text-xs outline-none mt-2 mb-2" style={{ background: C.linenSoft, color: C.ink, fontFamily: "'IBM Plex Mono', monospace" }} />
+            <button onClick={runPasteImport} disabled={!icsPaste.trim() || syncing} className="w-full py-2 rounded-xl text-xs font-medium disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+              Importer ce texte
+            </button>
+          </details>
+          {syncMsg && <p style={{ color: C.sauge }} className="text-xs mt-2">{syncMsg}</p>}
+          <p style={{ color: C.taupe }} className="text-xs mt-2">Import des dates uniquement (pas le nom ni le téléphone du client) — à compléter à la main dans la fiche de chaque réservation si besoin.</p>
+        </div>
+      )}
+
+      {isOwner && (
+        <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm mt-6" style={{ background: "#F3DCCF", color: C.terracotta }}>
+          <Icon name="trash" size={15} /> Supprimer ce logement
+        </button>
       )}
     </Sheet>
   );
@@ -962,26 +1739,249 @@ function PropertyDetail({ property, profile, onClose, onUpdate, onDelete }) {
 /* =========================================================
    ÉQUIPE TAB
 ========================================================= */
-function EquipeTab({ team, profile }) {
+/* =========================================================
+   STATS TAB — vue d'ensemble mensuelle (propriétaire uniquement)
+========================================================= */
+function StatSection({ title, children }) {
+  return (
+    <div className="mb-5">
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">{title}</p>
+      <div className="rounded-2xl px-3 py-1" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>{children}</div>
+    </div>
+  );
+}
+function StatRow({ left, right, color, last }) {
+  return (
+    <div className={`flex items-center justify-between py-2 ${last ? "" : "border-b"}`} style={{ borderColor: C.taupeLight }}>
+      <span style={{ color: C.ink }} className="text-xs">{left}</span>
+      <span style={{ color: color || C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs font-medium">{right}</span>
+    </div>
+  );
+}
+
+function StatsTab({ properties, cleanings, reservations, team, profile, saveCleanings, saveProperties }) {
+  const [monthOffset, setMonthOffset] = useState(0);
+  const [openLateId, setOpenLateId] = useState(null);
+
+  const now = new Date();
+  const base = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
+  const year = base.getFullYear(), month = base.getMonth();
+  const nDays = daysInMonth(year, month);
+  const monthLabel = base.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+  const monthStartISO = isoOf(year, month, 1);
+  const nextMonthStartISO = isoOf(year, month + 1, 1);
+
+  const cleaningsThisMonth = cleanings.filter((c) => c.date >= monthStartISO && c.date < nextMonthStartISO);
+  const pctColor = (pct) => (pct < 40 ? C.terracotta : pct < 70 ? C.or : C.sauge);
+
+  const occupancy = properties.map((p) => {
+    const nights = reservations.filter((r) => r.propertyId === p.id)
+      .reduce((sum, r) => sum + nightsOverlapISO(r.checkIn, r.checkOut, monthStartISO, nextMonthStartISO), 0);
+    const pct = Math.round((Math.min(nights, nDays) / nDays) * 100);
+    return { property: p, nights, pct };
+  });
+  const avgPct = occupancy.length ? Math.round(occupancy.reduce((s, o) => s + o.pct, 0) / occupancy.length) : 0;
+
+  const byPerson = team.map((t) => {
+    const list = cleaningsThisMonth.filter((c) => c.assignedToId === t.id);
+    const done = list.filter((c) => c.status === "termine").length;
+    return { person: t, total: list.length, done };
+  }).filter((x) => x.total > 0).sort((a, b) => b.total - a.total);
+
+  const late = cleanings.filter((c) => c.date < todayISO() && c.status !== "termine").sort((a, b) => a.date.localeCompare(b.date));
+
+  const revenueByProperty = properties.map((p) => {
+    let nights = 0, revenue = 0, hasPrice = false;
+    reservations.filter((r) => r.propertyId === p.id).forEach((r) => {
+      const n = nightsOverlapISO(r.checkIn, r.checkOut, monthStartISO, nextMonthStartISO);
+      nights += n;
+      // Le prix est un forfait ménage par séjour (pas un tarif par nuit) —
+      // on le compte une fois, rattaché au mois du départ du client.
+      if (r.cleaningPrice && r.checkOut >= monthStartISO && r.checkOut < nextMonthStartISO) { hasPrice = true; revenue += r.cleaningPrice; }
+    });
+    return { property: p, nights, revenue, hasPrice };
+  });
+  const totalRevenue = revenueByProperty.reduce((s, r) => s + r.revenue, 0);
+  const anyRevenue = revenueByProperty.some((r) => r.hasPrice);
+
+  const kitsByProperty = properties.map((p) => {
+    const log = p.laundryLog || [];
+    const count = log.filter((e) => e.date >= monthStartISO && e.date < nextMonthStartISO).reduce((s, e) => s + (e.count || 0), 0);
+    const price = p.kitPrice || 0;
+    return { property: p, count, price, total: count * price };
+  });
+  const totalKitsAmount = kitsByProperty.reduce((s, k) => s + k.total, 0);
+  const totalKitsCount = kitsByProperty.reduce((s, k) => s + k.count, 0);
+
+  const selfWashByProperty = properties.map((p) => {
+    const log = p.selfWashLog || [];
+    const count = log.filter((e) => e.date >= monthStartISO && e.date < nextMonthStartISO).reduce((s, e) => s + (e.count || 0), 0);
+    return { property: p, count };
+  });
+  const totalSelfWashCount = selfWashByProperty.reduce((s, k) => s + k.count, 0);
+
+  const propertyOf = (id) => properties.find((p) => p.id === id);
+  const personOf = (id) => team.find((t) => t.id === id);
+  const openLate = openLateId ? cleanings.find((c) => c.id === openLateId) : null;
+
+  return (
+    <div>
+      <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="text-lg font-semibold mb-4">Statistiques</h2>
+
+      <div className="flex items-center justify-between mb-5">
+        <button onClick={() => setMonthOffset((m) => m - 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronLeft" size={16} color={C.taupe} /></button>
+        <p style={{ color: C.ink, fontFamily: "'Space Grotesk', sans-serif" }} className="text-sm font-semibold capitalize">{monthLabel}</p>
+        <button onClick={() => setMonthOffset((m) => m + 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronRight" size={16} color={C.taupe} /></button>
+      </div>
+
+      {properties.length === 0 ? (
+        <EmptyState icon="home" text="Ajoute un logement pour voir apparaître tes statistiques." />
+      ) : (
+        <>
+          <StatSection title={`Taux de remplissage — moyenne ${avgPct}%`}>
+            {occupancy.map((o, i) => (
+              <div key={o.property.id} className={`flex items-center justify-between py-2 ${i === occupancy.length - 1 ? "" : "border-b"}`} style={{ borderColor: C.taupeLight }}>
+                <span style={{ color: C.ink }} className="text-xs">{o.property.name}</span>
+                <div className="flex items-center gap-2">
+                  <div className="w-16 h-1.5 rounded-full" style={{ background: C.linenSoft }}>
+                    <div className="h-1.5 rounded-full" style={{ width: `${o.pct}%`, background: pctColor(o.pct) }} />
+                  </div>
+                  <span style={{ color: pctColor(o.pct), fontFamily: "'IBM Plex Mono', monospace", minWidth: 32, textAlign: "right" }} className="text-xs font-semibold">{o.pct}%</span>
+                </div>
+              </div>
+            ))}
+          </StatSection>
+
+          <StatSection title="Ménages réalisés par personne ce mois-ci">
+            {byPerson.length === 0 ? (
+              <p style={{ color: C.taupe }} className="text-xs py-2">Aucun ménage assigné ce mois-ci.</p>
+            ) : byPerson.map((x, i) => (
+              <StatRow key={x.person.id} left={x.person.name} right={`${x.done}/${x.total} terminés`} last={i === byPerson.length - 1} />
+            ))}
+          </StatSection>
+
+          <StatSection title={`Ménages en retard (${late.length})`}>
+            {late.length === 0 ? (
+              <p style={{ color: C.sauge }} className="text-xs py-2">Aucun ménage en retard, bravo !</p>
+            ) : late.map((c, i) => (
+              <button key={c.id} onClick={() => setOpenLateId(c.id)} className={`w-full flex items-center justify-between py-2 text-left ${i === late.length - 1 ? "" : "border-b"}`} style={{ borderColor: C.taupeLight }}>
+                <span style={{ color: C.ink }} className="text-xs">{propertyOf(c.propertyId)?.name || "Logement supprimé"}</span>
+                <span style={{ color: C.terracotta, fontFamily: "'IBM Plex Mono', monospace" }} className="text-xs font-medium">{fmtDate(c.date)}</span>
+              </button>
+            ))}
+          </StatSection>
+
+          <StatSection title="Nuitées et ménages facturés par logement ce mois-ci">
+            {revenueByProperty.map((r, i) => (
+              <StatRow key={r.property.id} left={r.property.name}
+                right={`${r.nights} nuit${r.nights !== 1 ? "s" : ""}${r.hasPrice ? ` · ${r.revenue.toFixed(0)} €` : ""}`}
+                last={i === revenueByProperty.length - 1 && !anyRevenue} />
+            ))}
+            {anyRevenue && <StatRow left="Total" right={`${totalRevenue.toFixed(0)} €`} color={C.ink} last />}
+            {!anyRevenue && <p style={{ color: C.taupe }} className="text-[11px] pb-2">Ajoute un prix de ménage sur tes réservations pour voir apparaître les montants facturés.</p>}
+          </StatSection>
+
+          <StatSection title="Kits envoyés en blanchisserie ce mois-ci (à facturer)">
+            {kitsByProperty.map((k, i) => (
+              <StatRow key={k.property.id} left={k.property.name} right={`${k.count} kit${k.count !== 1 ? "s" : ""} × ${k.price}€ = ${k.total.toFixed(0)}€`} />
+            ))}
+            <StatRow left="Total à facturer" right={`${totalKitsAmount.toFixed(0)} € (${totalKitsCount} kits)`} color={C.terracotta} last />
+          </StatSection>
+
+          <StatSection title="Kits lavés par nous-même ce mois-ci">
+            {selfWashByProperty.map((k, i) => (
+              <StatRow key={k.property.id} left={k.property.name} right={`${k.count} kit${k.count !== 1 ? "s" : ""}`} />
+            ))}
+            <StatRow left="Total lavé par nous-même" right={`${totalSelfWashCount} kit${totalSelfWashCount !== 1 ? "s" : ""}`} color={C.sauge} last />
+          </StatSection>
+        </>
+      )}
+
+      {openLate && (
+        <CleaningDetail cleaning={openLate} property={propertyOf(openLate.propertyId)} properties={properties} saveProperties={saveProperties} team={team} person={personOf(openLate.assignedToId)} profile={profile}
+          onClose={() => setOpenLateId(null)}
+          onUpdate={async (patch) => {
+            await saveCleanings(cleanings.map((c) => (c.id === openLate.id ? { ...c, ...patch } : c)));
+          }}
+          onDelete={async () => { await saveCleanings(cleanings.filter((c) => c.id !== openLate.id)); setOpenLateId(null); }} />
+      )}
+    </div>
+  );
+}
+
+function EquipeTab({ team, profile, saveTeam, cleanings, saveCleanings, onSelfDeleted }) {
+  const [openId, setOpenId] = useState(null);
+  const isOwner = profile.role === "owner";
+  const openMember = openId ? team.find((t) => t.id === openId) : null;
+
   return (
     <div>
       <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="text-lg font-semibold mb-4">Équipe</h2>
       {team.length === 0 && <EmptyState icon="users" text="Personne n'a encore rejoint le planning." />}
       <div className="flex flex-col gap-2">
-        {team.map((t) => (
-          <div key={t.id} className="flex items-center gap-3 px-4 py-3 rounded-2xl" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
-            <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 36, height: 36, background: t.role === "owner" ? C.terracotta : C.sauge, color: "#fff", fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
-              {t.name.charAt(0).toUpperCase()}
-            </div>
-            <div className="flex-1">
-              <p style={{ color: C.ink }} className="text-sm font-medium">{t.name} {t.id === profile.id && <span style={{ color: C.taupe }}>(toi)</span>}</p>
-              <p style={{ color: C.taupe }} className="text-xs">{t.role === "owner" ? "Propriétaire" : "Équipe de ménage"}</p>
-            </div>
-          </div>
-        ))}
+        {team.map((t) => {
+          const Wrapper = isOwner ? "button" : "div";
+          return (
+            <Wrapper key={t.id} onClick={isOwner ? () => setOpenId(t.id) : undefined}
+              className="w-full text-left flex items-center gap-3 px-4 py-3 rounded-2xl" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
+              <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 36, height: 36, background: t.role === "owner" ? C.terracotta : C.sauge, color: "#fff", fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
+                {t.name.charAt(0).toUpperCase()}
+              </div>
+              <div className="flex-1">
+                <p style={{ color: C.ink }} className="text-sm font-medium">{t.name} {t.id === profile.id && <span style={{ color: C.taupe }}>(toi)</span>}</p>
+                <p style={{ color: C.taupe }} className="text-xs">{t.role === "owner" ? "Propriétaire" : "Équipe de ménage"}</p>
+              </div>
+              {isOwner && <Icon name="chevronRight" size={18} color={C.taupe} />}
+            </Wrapper>
+          );
+        })}
       </div>
       <p style={{ color: C.taupe }} className="text-xs mt-5">Une personne rejoint automatiquement l'équipe en ouvrant l'appli et en choisissant son prénom et son rôle.</p>
+
+      {openMember && (
+        <MemberDetail member={openMember} isSelf={openMember.id === profile.id} onClose={() => setOpenId(null)}
+          onUpdate={async (patch) => { await saveTeam(team.map((t) => (t.id === openMember.id ? { ...t, ...patch } : t))); setOpenId(null); }}
+          onDelete={async () => {
+            await saveTeam(team.filter((t) => t.id !== openMember.id));
+            await saveCleanings(cleanings.map((c) => (c.assignedToId === openMember.id ? { ...c, assignedToId: null } : c)));
+            setOpenId(null);
+            if (openMember.id === profile.id) onSelfDeleted();
+          }} />
+      )}
     </div>
+  );
+}
+
+function MemberDetail({ member, isSelf, onClose, onUpdate, onDelete }) {
+  const [name, setName] = useState(member.name);
+  const [role, setRole] = useState(member.role);
+  return (
+    <Sheet onClose={onClose} title="Modifier le profil">
+      <Field label="Prénom">
+        <input value={name} onChange={(e) => setName(e.target.value)} style={selectStyle} />
+      </Field>
+      <div className="h-3" />
+      <Field label="Rôle">
+        <div className="grid grid-cols-2 gap-3 mt-1.5">
+          <button onClick={() => setRole("owner")} className="rounded-xl py-2.5 text-sm font-medium border transition"
+            style={{ background: role === "owner" ? C.terracotta : "transparent", color: role === "owner" ? "#fff" : C.taupe, borderColor: C.terracotta }}>
+            Propriétaire
+          </button>
+          <button onClick={() => setRole("cleaner")} className="rounded-xl py-2.5 text-sm font-medium border transition"
+            style={{ background: role === "cleaner" ? C.sauge : "transparent", color: role === "cleaner" ? "#fff" : C.taupe, borderColor: C.sauge }}>
+            Équipe de ménage
+          </button>
+        </div>
+      </Field>
+      <button disabled={!name.trim()} onClick={() => onUpdate({ name: name.trim(), role })} className="w-full py-3 rounded-xl font-medium mt-5 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+        Enregistrer
+      </button>
+      {isSelf && <p style={{ color: C.taupe }} className="text-xs mt-3">C'est ton propre profil.</p>}
+      <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm mt-3" style={{ background: "#F3DCCF", color: C.terracotta }}>
+        <Icon name="trash" size={15} /> Supprimer ce profil
+      </button>
+      <p style={{ color: C.taupe }} className="text-xs mt-2">Les ménages déjà assignés à cette personne repasseront en "non assigné".</p>
+    </Sheet>
   );
 }
 
