@@ -1,4 +1,4 @@
-const CACHE_NAME = "planning-menage-v1";
+const CACHE_NAME = "planning-menage-v2";
 const SHELL_FILES = [
   "./index.html",
   "./manifest.json",
@@ -22,12 +22,21 @@ self.addEventListener("activate", (event) => {
   self.clients.claim();
 });
 
-// App shell: cache-first. Tout le reste (Firebase, polices, CDN) passe par le réseau normalement.
+// App shell : RÉSEAU EN PRIORITÉ. On va toujours chercher la dernière version
+// en ligne d'abord ; le cache ne sert que de secours si le réseau est
+// injoignable (hors-ligne). Ça évite qu'une version installée sur l'écran
+// d'accueil reste bloquée sur une ancienne version de l'appli.
 self.addEventListener("fetch", (event) => {
   const url = new URL(event.request.url);
   if (url.origin === self.location.origin) {
     event.respondWith(
-      caches.match(event.request).then((cached) => cached || fetch(event.request))
+      fetch(event.request)
+        .then((response) => {
+          const copy = response.clone();
+          caches.open(CACHE_NAME).then((cache) => cache.put(event.request, copy)).catch(() => {});
+          return response;
+        })
+        .catch(() => caches.match(event.request))
     );
   }
 });
