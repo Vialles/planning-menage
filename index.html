@@ -16,6 +16,7 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/[email protected]/dist/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -44,7 +45,7 @@
   // ⚠️ CONFIGURATION GOOGLE AGENDA — à remplir (voir README.md, section
   // "Synchronisation Google Agenda"). Laisser tel quel désactive juste le
   // bouton de connexion, le reste de l'appli fonctionne normalement.
-  window.__GOOGLE_CLIENT_ID__ = "REMPLACE_MOI.apps.googleusercontent.com";
+  window.__GOOGLE_CLIENT_ID__ = "422695079008-pc7ktr98rdsdmvt8pn6mbc9nc6f1206s.apps.googleusercontent.com";
 </script>
 
 <script type="text/plain" id="app-source">
@@ -237,7 +238,7 @@ async function syncFromICS(icsText, propertyId, reservations, saveReservations, 
     if (exists) continue;
     const newRes = {
       id: uid(), propertyId, guestName: ev.summary && ev.summary !== "Reserved" && ev.summary !== "Blocked" ? ev.summary : "Réservation Hostaway",
-      checkIn: ev.dtstart, checkOut: ev.dtend, source: "hostaway", cleaningPrice: 0, guestPhone: "",
+      checkIn: ev.dtstart, checkOut: ev.dtend, source: "hostaway", cleaningPrice: null, guestPhone: "",
     };
     nextRes.push(newRes);
     created.push(newRes);
@@ -274,6 +275,7 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     logOut: "M15 4H6v16h9 M10 12h11 M17 8l4 4-4 4",
     pencil: "M4 20h4L18.5 9.5a2 2 0 0 0-4-4L4 16v4Z",
     phone: "M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z",
+    download: "M12 4v11 M7.5 11 12 15.5 16.5 11 M4 19h16",
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
@@ -557,30 +559,34 @@ function App() {
   if (!profile) return <Onboarding onDone={completeOnboarding} />;
 
   return (
-    <div style={{ background: C.linen, fontFamily: "'Inter', sans-serif" }} className="min-h-screen flex flex-col">
-      <Header profile={profile} onSwitch={switchProfile} offline={offline} onOpenGCal={() => setShowGCal(true)} />
-      {error && (
-        <div className="mx-4 mt-3 rounded-lg px-3 py-2 text-sm flex items-center gap-2" style={{ background: "#F3DCCF", color: C.terracotta }}>
-          <Icon name="alert" size={16} /><span className="flex-1">{error}</span>
-          <button onClick={() => setError("")}><Icon name="x" size={14} /></button>
-        </div>
-      )}
-      <main className="flex-1 overflow-y-auto pb-24 px-4">
-        {tab === "planning" && (
-          <PlanningTab profile={profile} team={team} properties={properties} cleanings={cleanings} saveCleanings={saveCleanings} saveProperties={saveProperties} />
-        )}
-        {tab === "occupation" && (
-          <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} cleanings={cleanings} saveCleanings={saveCleanings} />
-        )}
-        {tab === "stats" && profile.role === "owner" && (
-          <StatsTab properties={properties} cleanings={cleanings} reservations={reservations} team={team} profile={profile} saveCleanings={saveCleanings} saveProperties={saveProperties} />
-        )}
-        {tab === "proprietes" && (
-          <ProprietesTab profile={profile} properties={properties} saveProperties={saveProperties} cleanings={cleanings} saveCleanings={saveCleanings} reservations={reservations} saveReservations={saveReservations} />
-        )}
-        {tab === "equipe" && <EquipeTab team={team} profile={profile} saveTeam={saveTeam} cleanings={cleanings} saveCleanings={saveCleanings} onSelfDeleted={switchProfile} />}
-      </main>
+    <div style={{ background: C.linen, fontFamily: "'Inter', sans-serif" }} className="min-h-screen flex flex-col md:flex-row">
       <TabBar tab={tab} setTab={setTab} role={profile.role} />
+      <div className="flex-1 flex flex-col min-w-0 md:pl-56">
+        <Header profile={profile} onSwitch={switchProfile} offline={offline} onOpenGCal={() => setShowGCal(true)} />
+        {error && (
+          <div className="mx-4 md:mx-8 mt-3 rounded-lg px-3 py-2 text-sm flex items-center gap-2" style={{ background: "#F3DCCF", color: C.terracotta }}>
+            <Icon name="alert" size={16} /><span className="flex-1">{error}</span>
+            <button onClick={() => setError("")}><Icon name="x" size={14} /></button>
+          </div>
+        )}
+        <main className="flex-1 overflow-y-auto pb-24 md:pb-10 px-4 md:px-8">
+          <div className="md:max-w-3xl md:mx-auto">
+            {tab === "planning" && (
+              <PlanningTab profile={profile} team={team} properties={properties} cleanings={cleanings} saveCleanings={saveCleanings} saveProperties={saveProperties} />
+            )}
+            {tab === "occupation" && (
+              <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} cleanings={cleanings} saveCleanings={saveCleanings} />
+            )}
+            {tab === "stats" && profile.role === "owner" && (
+              <StatsTab properties={properties} cleanings={cleanings} reservations={reservations} team={team} profile={profile} saveCleanings={saveCleanings} saveProperties={saveProperties} />
+            )}
+            {tab === "proprietes" && (
+              <ProprietesTab profile={profile} properties={properties} saveProperties={saveProperties} cleanings={cleanings} saveCleanings={saveCleanings} reservations={reservations} saveReservations={saveReservations} />
+            )}
+            {tab === "equipe" && <EquipeTab team={team} profile={profile} saveTeam={saveTeam} cleanings={cleanings} saveCleanings={saveCleanings} onSelfDeleted={switchProfile} />}
+          </div>
+        </main>
+      </div>
       {showGCal && (
         <GoogleAgendaPanel profile={profile} cleanings={cleanings} properties={properties} onClose={() => setShowGCal(false)} />
       )}
@@ -640,7 +646,7 @@ function Onboarding({ onDone }) {
 ========================================================= */
 function Header({ profile, onSwitch, offline, onOpenGCal }) {
   return (
-    <header className="px-5 pt-6 pb-4 flex items-center justify-between">
+    <header className="px-5 pt-6 pb-4 md:px-8 md:pt-8 flex items-center justify-between">
       <div>
         <p style={{ color: C.taupe }} className="text-xs uppercase tracking-wide">
           {profile.role === "owner" ? "Propriétaire" : "Équipe de ménage"}{offline ? " · hors ligne" : ""}
@@ -668,13 +674,18 @@ function TabBar({ tab, setTab, role }) {
     { id: "equipe", label: "Équipe", icon: "users" },
   ];
   return (
-    <nav className="fixed bottom-0 left-0 right-0 flex justify-around items-center py-2 border-t" style={{ background: C.linen, borderColor: C.taupeLight, paddingBottom: "calc(env(safe-area-inset-bottom) + 6px)" }}>
+    <nav className="fixed bottom-0 left-0 right-0 flex justify-around items-center py-2 border-t z-20
+      md:top-0 md:bottom-0 md:right-auto md:w-56 md:flex-col md:items-stretch md:justify-start md:border-t-0 md:border-r md:py-8 md:px-3 md:gap-1"
+      style={{ background: C.linen, borderColor: C.taupeLight, paddingBottom: "calc(env(safe-area-inset-bottom) + 6px)" }}>
+      <p className="hidden md:block px-3 pb-4 text-xs uppercase tracking-wide" style={{ color: C.taupe, fontFamily: "'Space Grotesk', sans-serif" }}>Planning Ménage</p>
       {items.map(({ id, label, icon }) => {
         const active = tab === id;
         return (
-          <button key={id} onClick={() => setTab(id)} className="flex flex-col items-center gap-1 px-2 py-1.5 rounded-xl transition" style={{ color: active ? C.terracotta : C.taupe }}>
+          <button key={id} onClick={() => setTab(id)}
+            className="flex flex-col items-center gap-1 px-2 py-1.5 rounded-xl transition md:flex-row md:justify-start md:gap-3 md:px-3 md:py-2.5 md:w-full"
+            style={{ color: active ? C.terracotta : C.taupe, background: active ? "#F3DCCF" : "transparent" }}>
             <Icon name={icon} size={19} strokeWidth={active ? 2.4 : 1.8} />
-            <span className="text-[10px] font-medium">{label}</span>
+            <span className="text-[10px] font-medium md:text-sm">{label}</span>
           </button>
         );
       })}
@@ -1385,14 +1396,16 @@ function ReservationForm({ properties, onClose, onCreate, initial }) {
   const [checkIn, setCheckIn] = useState(initial?.checkIn || todayISO());
   const [checkOut, setCheckOut] = useState(initial?.checkOut || todayISO());
   const [source, setSource] = useState(initial?.source || "airbnb");
-  const [cleaningPrice, setCleaningPrice] = useState(initial?.cleaningPrice ? String(initial.cleaningPrice) : "");
+  const [cleaningPrice, setCleaningPrice] = useState(initial?.cleaningPrice != null ? String(initial.cleaningPrice) : "");
   const [guestPhone, setGuestPhone] = useState(initial?.guestPhone || "");
   const [submitting, setSubmitting] = useState(false);
+  const selectedProperty = properties.find((p) => p.id === propertyId);
+  const normalPrice = selectedProperty?.defaultCleaningPrice;
 
   const submit = async () => {
     if (!propertyId || !guestName.trim() || checkOut <= checkIn || submitting) return;
     setSubmitting(true);
-    await onCreate({ propertyId, guestName: guestName.trim(), checkIn, checkOut, source, cleaningPrice: Number(cleaningPrice) || 0, guestPhone: guestPhone.trim() });
+    await onCreate({ propertyId, guestName: guestName.trim(), checkIn, checkOut, source, cleaningPrice: cleaningPrice.trim() === "" ? null : Number(cleaningPrice), guestPhone: guestPhone.trim() });
     // pas de setSubmitting(false) ici : la fiche se ferme juste après (onCreate
     // déclenche la fermeture côté parent) — remettre à false provoquerait un
     // réaffichage du bouton actif pendant l'instant de la fermeture.
@@ -1428,9 +1441,13 @@ function ReservationForm({ properties, onClose, onCreate, initial }) {
               ))}
             </div>
           </Field>
-          <Field label="Prix du ménage (optionnel, pour les statistiques)">
-            <input type="number" min="0" step="0.01" value={cleaningPrice} onChange={(e) => setCleaningPrice(e.target.value)} placeholder="Ex. 60" style={selectStyle} />
+          <Field label={`Prix du ménage${normalPrice != null ? ` (normal : ${normalPrice} €)` : " (optionnel, pour les statistiques)"}`}>
+            <input type="number" min="0" step="1" value={cleaningPrice} onChange={(e) => setCleaningPrice(e.target.value)}
+              placeholder={normalPrice != null ? `Laisser vide = ${normalPrice} €` : "Ex. 60"} style={selectStyle} />
           </Field>
+          {cleaningPrice.trim() !== "" && normalPrice != null && Number(cleaningPrice) !== normalPrice && (
+            <p className="text-xs -mt-2" style={{ color: C.or }}>Prix exceptionnel : ce montant sera utilisé à la place du prix normal ({normalPrice} €) pour cette réservation.</p>
+          )}
           <button onClick={submit} disabled={!guestName.trim() || checkOut <= checkIn || submitting} className="w-full py-3 rounded-xl font-medium mt-2 disabled:opacity-50 flex items-center justify-center gap-2" style={{ background: C.ink, color: C.linen }}>
             {submitting && <div className="animate-spin"><Icon name="loader" size={16} /></div>}
             {initial ? "Enregistrer" : "Ajouter la réservation"}
@@ -1445,6 +1462,9 @@ function ReservationDetail({ reservation, property, profile, onClose, onUpdate, 
   const [editing, setEditing] = useState(false);
   const nights = Math.round((parseISO(reservation.checkOut) - parseISO(reservation.checkIn)) / 86400000);
   const src = SOURCES[reservation.source] || SOURCES.autre;
+  const normalPrice = property?.defaultCleaningPrice;
+  const effectivePrice = reservation.cleaningPrice != null ? reservation.cleaningPrice : normalPrice;
+  const isException = reservation.cleaningPrice != null && normalPrice != null && reservation.cleaningPrice !== normalPrice;
 
   if (editing) {
     return (
@@ -1474,7 +1494,7 @@ function ReservationDetail({ reservation, property, profile, onClose, onUpdate, 
         </a>
       )}
       <p style={{ color: C.taupe }} className="text-xs mb-5">
-        {nights} nuit{nights > 1 ? "s" : ""}{reservation.cleaningPrice ? ` · ménage : ${reservation.cleaningPrice} €` : ""}
+        {nights} nuit{nights > 1 ? "s" : ""}{effectivePrice != null ? ` · ménage : ${effectivePrice} €${isException ? " (exceptionnel)" : ""}` : ""}
       </p>
 
       {profile.role === "owner" && (
@@ -1576,6 +1596,7 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const [newItem, setNewItem] = useState("");
   const [notes, setNotes] = useState(property.notes || "");
   const [kitPrice, setKitPrice] = useState(property.kitPrice != null ? String(property.kitPrice) : "15");
+  const [defaultCleaningPrice, setDefaultCleaningPrice] = useState(property.defaultCleaningPrice != null ? String(property.defaultCleaningPrice) : "");
   const [icalUrl, setIcalUrl] = useState(property.icalUrl || "");
   const [icsPaste, setIcsPaste] = useState("");
   const [syncing, setSyncing] = useState(false);
@@ -1585,6 +1606,7 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const removeItem = (id) => onUpdate({ checklist: property.checklist.filter((i) => i.id !== id) });
   const saveNotes = () => onUpdate({ notes });
   const saveKitPrice = () => onUpdate({ kitPrice: Number(kitPrice) || 0 });
+  const saveDefaultCleaningPrice = () => onUpdate({ defaultCleaningPrice: defaultCleaningPrice.trim() === "" ? null : Number(defaultCleaningPrice) });
   const saveIcalUrl = () => onUpdate({ icalUrl: icalUrl.trim() });
 
   const runSync = async () => {
@@ -1687,6 +1709,13 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
           <input type="number" min="0" step="0.5" value={kitPrice} onChange={(e) => setKitPrice(e.target.value)} onBlur={saveKitPrice} style={selectStyle} />
         </Field>
       )}
+      <div className="h-3" />
+      {isOwner && (
+        <Field label="Prix normal du ménage pour ce logement (€)">
+          <input type="number" min="0" step="1" value={defaultCleaningPrice} onChange={(e) => setDefaultCleaningPrice(e.target.value)} onBlur={saveDefaultCleaningPrice} placeholder="Ex. 60" style={selectStyle} />
+        </Field>
+      )}
+      <p style={{ color: C.taupe }} className="text-xs mt-1.5 mb-2">Ce prix s'applique automatiquement à chaque réservation de ce logement. Sur une réservation précise, tu peux saisir un prix différent (ménage exceptionnellement plus long) — il sera alors utilisé à la place du prix normal.</p>
 
       <p style={{ color: C.ink, marginTop: 20 }} className="text-sm font-semibold mb-2">Checklist de ménage</p>
       <div className="flex flex-col gap-2 mb-3">
@@ -1759,6 +1788,42 @@ function StatRow({ left, right, color, last }) {
   );
 }
 
+// Génère et télécharge un fichier Excel (.xlsx) reprenant toutes les
+// données affichées sur la page Statistiques pour le mois consulté.
+function exportStatsToExcel({ monthLabel, occupancy, byPerson, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf }) {
+  const wb = XLSX.utils.book_new();
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    occupancy.map((o) => ({ Logement: o.property.name, "Taux de remplissage (%)": o.pct, "Nuits réservées": o.nights }))
+  ), "Occupation");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    byPerson.map((b) => ({ Personne: b.person.name, "Ménages ce mois-ci": b.total, "Dont terminés": b.done }))
+  ), "Équipe");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    late.map((c) => ({
+      Logement: propertyOf(c.propertyId)?.name || "", Date: c.date, "Assigné à": personOf(c.assignedToId)?.name || "Non assigné",
+      Statut: STATUS[c.status]?.label || c.status,
+    }))
+  ), "Ménages en retard");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    revenueByProperty.map((r) => ({ Logement: r.property.name, Nuits: r.nights, "Montant ménages (€)": r.hasPrice ? r.revenue : "" }))
+  ), "Nuitées et ménages");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    kitsByProperty.map((k) => ({ Logement: k.property.name, "Kits envoyés en blanchisserie": k.count, "Prix par kit (€)": k.price, "Total à facturer (€)": k.total }))
+  ), "Blanchisserie");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    selfWashByProperty.map((k) => ({ Logement: k.property.name, "Kits lavés par nous-même": k.count }))
+  ), "Lavé par nous-même");
+
+  const safeMonth = monthLabel.replace(/\s+/g, "-");
+  XLSX.writeFile(wb, `statistiques-${safeMonth}.xlsx`);
+}
+
 function StatsTab({ properties, cleanings, reservations, team, profile, saveCleanings, saveProperties }) {
   const [monthOffset, setMonthOffset] = useState(0);
   const [openLateId, setOpenLateId] = useState(null);
@@ -1795,9 +1860,12 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
     reservations.filter((r) => r.propertyId === p.id).forEach((r) => {
       const n = nightsOverlapISO(r.checkIn, r.checkOut, monthStartISO, nextMonthStartISO);
       nights += n;
-      // Le prix est un forfait ménage par séjour (pas un tarif par nuit) —
-      // on le compte une fois, rattaché au mois du départ du client.
-      if (r.cleaningPrice && r.checkOut >= monthStartISO && r.checkOut < nextMonthStartISO) { hasPrice = true; revenue += r.cleaningPrice; }
+      // Le prix est un forfait ménage par séjour (pas un tarif par nuit),
+      // rattaché au mois du départ du client. Une réservation peut
+      // surcharger le prix normal du logement (ménage exceptionnel) ;
+      // sinon on retombe sur le prix normal défini sur le logement.
+      const effectivePrice = r.cleaningPrice != null ? r.cleaningPrice : p.defaultCleaningPrice;
+      if (effectivePrice && r.checkOut >= monthStartISO && r.checkOut < nextMonthStartISO) { hasPrice = true; revenue += effectivePrice; }
     });
     return { property: p, nights, revenue, hasPrice };
   });
@@ -1823,10 +1891,22 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
   const propertyOf = (id) => properties.find((p) => p.id === id);
   const personOf = (id) => team.find((t) => t.id === id);
   const openLate = openLateId ? cleanings.find((c) => c.id === openLateId) : null;
+  const doExport = () => {
+    try {
+      exportStatsToExcel({ monthLabel, occupancy, byPerson, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf });
+    } catch (e) {}
+  };
 
   return (
     <div>
-      <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="text-lg font-semibold mb-4">Statistiques</h2>
+      <div className="flex items-center justify-between mb-4">
+        <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="text-lg font-semibold">Statistiques</h2>
+        {properties.length > 0 && (
+          <button onClick={doExport} className="flex items-center gap-1.5 text-xs font-medium px-3 py-2 rounded-xl" style={{ background: C.linenSoft, color: C.ink }}>
+            <Icon name="download" size={14} color={C.taupe} /> Exporter en Excel
+          </button>
+        )}
+      </div>
 
       <div className="flex items-center justify-between mb-5">
         <button onClick={() => setMonthOffset((m) => m - 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronLeft" size={16} color={C.taupe} /></button>
@@ -1998,8 +2078,8 @@ function EmptyState({ icon, text }) {
 }
 function Sheet({ title, onClose, children }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-end justify-center" style={{ background: "rgba(32,38,31,0.45)" }} onClick={onClose}>
-      <div onClick={(e) => e.stopPropagation()} className="w-full max-w-md rounded-t-3xl px-5 pt-5 pb-8 max-h-[85vh] overflow-y-auto" style={{ background: C.linen }}>
+    <div className="fixed inset-0 z-50 flex items-end md:items-center justify-center" style={{ background: "rgba(32,38,31,0.45)" }} onClick={onClose}>
+      <div onClick={(e) => e.stopPropagation()} className="w-full max-w-md rounded-t-3xl md:rounded-3xl px-5 pt-5 pb-8 md:pb-6 max-h-[85vh] overflow-y-auto md:shadow-2xl" style={{ background: C.linen }}>
         <div className="flex items-center justify-between mb-5">
           <h2 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="text-lg font-semibold pr-4">{title}</h2>
           <button onClick={onClose} className="rounded-full p-1.5 shrink-0" style={{ background: C.linenSoft }}><Icon name="x" size={16} color={C.taupe} /></button>
