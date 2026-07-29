@@ -25,6 +25,12 @@
   html, body, #root { height: 100%; margin: 0; }
   body { -webkit-tap-highlight-color: transparent; overscroll-behavior-y: none; }
   ::-webkit-scrollbar { display: none; }
+  @media (hover: hover) and (pointer: fine) {
+    ::-webkit-scrollbar { display: block; width: 8px; height: 8px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: #D8D0C2; border-radius: 8px; }
+    ::-webkit-scrollbar-thumb:hover { background: #9C9284; }
+  }
 </style>
 </head>
 <body>
@@ -65,10 +71,11 @@ const C = {
   taupeLight: "#D8D0C2",
   bleu: "#2F6690",
   rose: "#B84A5C",
+  violet: "#7C6B9C",
 };
 
 const STATUS = {
-  a_attribuer: { label: "À attribuer", color: C.terracotta, bg: "#F3DCCF" },
+  a_attribuer: { label: "À attribuer", color: C.violet, bg: "#E7E2F0" },
   a_faire: { label: "À faire", color: C.or, bg: "#F1E3C4" },
   termine: { label: "Terminé", color: C.sauge, bg: "#DDE7DF" },
 };
@@ -149,51 +156,82 @@ async function addManualDirtyKit(propertyId, properties, saveProperties, qty) {
 }
 
 // Automatisation : à la fin de chaque séjour (date de départ), un ménage est
-// créé automatiquement pour le logement concerné — pas besoin de le saisir à
-// la main. `sourceReservationId` garde le lien entre le ménage et la
-// réservation qui l'a généré.
-async function createLinkedCleaning(reservation, cleanings, saveCleanings) {
-  const exists = cleanings.some((c) => c.propertyId === reservation.propertyId && c.date === reservation.checkOut);
-  if (exists) return; // déjà un ménage ce jour-là pour ce logement, on ne duplique pas
+// créé automatiquement pour le logement concerné. Si la remise de clés en
+// main propre est activée sur le logement, une mission "Arrivée client" est
+// aussi créée à la date d'arrivée. `sourceReservationId` garde le lien entre
+// la mission et la réservation qui l'a générée ; `type` distingue les deux
+// ("menage" par défaut si absent, pour les ménages créés avant cette
+// fonctionnalité).
+async function createLinkedMission(reservation, cleanings, saveCleanings, type, date, time) {
+  const exists = cleanings.some((c) => c.propertyId === reservation.propertyId && c.date === date && (c.type || "menage") === type);
+  if (exists) return; // déjà une mission de ce type ce jour-là pour ce logement, on ne duplique pas
   const next = [...cleanings, {
-    id: uid(), propertyId: reservation.propertyId, date: reservation.checkOut, time: "11:00",
-    assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: reservation.id,
+    id: uid(), propertyId: reservation.propertyId, date, time,
+    assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: reservation.id, type,
   }];
   await saveCleanings(next);
 }
-async function syncLinkedCleaning(reservation, cleanings, saveCleanings) {
-  const linked = cleanings.find((c) => c.sourceReservationId === reservation.id);
-  if (!linked) { await createLinkedCleaning(reservation, cleanings, saveCleanings); return; }
-  if (linked.date !== reservation.checkOut || linked.propertyId !== reservation.propertyId) {
-    const clash = cleanings.some((c) => c.id !== linked.id && c.propertyId === reservation.propertyId && c.date === reservation.checkOut);
+async function createLinkedCleaning(reservation, cleanings, saveCleanings) {
+  await createLinkedMission(reservation, cleanings, saveCleanings, "menage", reservation.checkOut, "11:00");
+}
+async function createLinkedArrival(reservation, cleanings, saveCleanings) {
+  await createLinkedMission(reservation, cleanings, saveCleanings, "arrivee", reservation.checkIn, "16:00");
+}
+async function syncLinkedMission(reservation, cleanings, saveCleanings, type, date) {
+  const linked = cleanings.find((c) => c.sourceReservationId === reservation.id && (c.type || "menage") === type);
+  if (!linked) { await createLinkedMission(reservation, cleanings, saveCleanings, type, date, type === "arrivee" ? "16:00" : "11:00"); return; }
+  if (linked.date !== date || linked.propertyId !== reservation.propertyId) {
+    const clash = cleanings.some((c) => c.id !== linked.id && c.propertyId === reservation.propertyId && c.date === date && (c.type || "menage") === type);
     if (!clash) {
-      await saveCleanings(cleanings.map((c) => (c.id === linked.id ? { ...c, date: reservation.checkOut, propertyId: reservation.propertyId } : c)));
+      await saveCleanings(cleanings.map((c) => (c.id === linked.id ? { ...c, date, propertyId: reservation.propertyId } : c)));
     }
   }
 }
-async function handleReservationDeleted(reservation, cleanings, saveCleanings) {
-  const linked = cleanings.find((c) => c.sourceReservationId === reservation.id);
-  if (!linked) return;
-  if (linked.status === "a_faire") {
-    // ménage pas encore commencé : on le retire avec la réservation
-    await saveCleanings(cleanings.filter((c) => c.id !== linked.id));
-  } else {
-    // du travail a déjà été fait dessus : on le garde, juste dé-lié
-    await saveCleanings(cleanings.map((c) => (c.id === linked.id ? { ...c, sourceReservationId: null } : c)));
+// Synchronise à la fois le ménage (départ) et, si activée sur le logement,
+// la mission d'arrivée client — à appeler après la création ou la
+// modification d'une réservation.
+async function syncReservationMissions(reservation, property, cleanings, saveCleanings) {
+  await syncLinkedMission(reservation, cleanings, saveCleanings, "menage", reservation.checkOut);
+  if (property?.keyHandoverEnabled) {
+    await syncLinkedMission(reservation, cleanings, saveCleanings, "arrivee", reservation.checkIn);
   }
 }
-// Balaie toutes les réservations existantes et crée les ménages manquants en
-// une seule fois (utile pour rattraper les réservations saisies avant que
-// l'automatisation n'existe).
-async function generateMissingCleanings(reservations, cleanings, saveCleanings) {
+async function handleReservationDeleted(reservation, cleanings, saveCleanings) {
+  const linked = cleanings.filter((c) => c.sourceReservationId === reservation.id);
+  if (linked.length === 0) return;
+  let next = [...cleanings];
+  for (const l of linked) {
+    if (l.status !== "termine") {
+      // mission pas encore terminée : on la retire avec la réservation
+      next = next.filter((c) => c.id !== l.id);
+    } else {
+      // du travail a déjà été fait dessus : on la garde, juste dé-liée
+      next = next.map((c) => (c.id === l.id ? { ...c, sourceReservationId: null } : c));
+    }
+  }
+  await saveCleanings(next);
+}
+// Balaie toutes les réservations existantes et crée les missions manquantes
+// (ménage + arrivée client si activée) en une seule fois — utile pour
+// rattraper les réservations saisies avant que l'automatisation n'existe.
+async function generateMissingCleanings(reservations, properties, cleanings, saveCleanings) {
   const next = [...cleanings];
   let added = 0;
   for (const r of reservations) {
-    const alreadyLinked = next.some((c) => c.sourceReservationId === r.id);
-    const alreadySameSlot = next.some((c) => c.propertyId === r.propertyId && c.date === r.checkOut);
-    if (!alreadyLinked && !alreadySameSlot) {
-      next.push({ id: uid(), propertyId: r.propertyId, date: r.checkOut, time: "11:00", assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: r.id });
+    const property = properties.find((p) => p.id === r.propertyId);
+    const alreadyMenage = next.some((c) => c.sourceReservationId === r.id && (c.type || "menage") === "menage");
+    const clashMenage = next.some((c) => c.propertyId === r.propertyId && c.date === r.checkOut && (c.type || "menage") === "menage");
+    if (!alreadyMenage && !clashMenage) {
+      next.push({ id: uid(), propertyId: r.propertyId, date: r.checkOut, time: "11:00", assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: r.id, type: "menage" });
       added++;
+    }
+    if (property?.keyHandoverEnabled) {
+      const alreadyArrivee = next.some((c) => c.sourceReservationId === r.id && c.type === "arrivee");
+      const clashArrivee = next.some((c) => c.propertyId === r.propertyId && c.date === r.checkIn && c.type === "arrivee");
+      if (!alreadyArrivee && !clashArrivee) {
+        next.push({ id: uid(), propertyId: r.propertyId, date: r.checkIn, time: "16:00", assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: r.id, type: "arrivee" });
+        added++;
+      }
     }
   }
   if (added > 0) await saveCleanings(next);
@@ -228,16 +266,16 @@ function parseICS(text) {
   }
   return events;
 }
-async function syncFromICS(icsText, propertyId, reservations, saveReservations, cleanings, saveCleanings) {
+async function syncFromICS(icsText, property, reservations, saveReservations, cleanings, saveCleanings) {
   const events = parseICS(icsText);
   const nextRes = [...reservations];
   const created = [];
   for (const ev of events) {
     if (!ev.dtstart || !ev.dtend || ev.dtend <= ev.dtstart) continue;
-    const exists = nextRes.some((r) => r.propertyId === propertyId && r.checkIn === ev.dtstart && r.checkOut === ev.dtend);
+    const exists = nextRes.some((r) => r.propertyId === property.id && r.checkIn === ev.dtstart && r.checkOut === ev.dtend);
     if (exists) continue;
     const newRes = {
-      id: uid(), propertyId, guestName: ev.summary && ev.summary !== "Reserved" && ev.summary !== "Blocked" ? ev.summary : "Réservation Hostaway",
+      id: uid(), propertyId: property.id, guestName: ev.summary && ev.summary !== "Reserved" && ev.summary !== "Blocked" ? ev.summary : "Réservation Hostaway",
       checkIn: ev.dtstart, checkOut: ev.dtend, source: "hostaway", cleaningPrice: null, guestPhone: "",
     };
     nextRes.push(newRes);
@@ -245,7 +283,7 @@ async function syncFromICS(icsText, propertyId, reservations, saveReservations, 
   }
   if (created.length > 0) {
     await saveReservations(nextRes);
-    for (const r of created) await createLinkedCleaning(r, cleanings, saveCleanings);
+    for (const r of created) await syncReservationMissions(r, property, cleanings, saveCleanings);
   }
   return created.length;
 }
@@ -276,6 +314,7 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     pencil: "M4 20h4L18.5 9.5a2 2 0 0 0-4-4L4 16v4Z",
     phone: "M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z",
     download: "M12 4v11 M7.5 11 12 15.5 16.5 11 M4 19h16",
+    key: "M15 7a4 4 0 1 0-3.9 4H15l2 2 2-2 2 2 2-2-2-2h-4.1",
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
@@ -419,18 +458,53 @@ async function gcalApi(method, path, token, body) {
   if (!res.ok) throw new Error("gcal api failed: " + res.status);
   return res.json();
 }
-function cleaningSignature(c) { return `${c.date}|${c.time}|${c.propertyId}|${c.status}|${c.notes || ""}`; }
+// Palette officielle des couleurs d'événement Google Agenda (fixe, ce sont
+// les seules disponibles via l'API).
+const GCAL_COLORS = [
+  { id: "1", name: "Lavande", hex: "#7986CB" },
+  { id: "2", name: "Sauge", hex: "#33B679" },
+  { id: "3", name: "Raisin", hex: "#8E24AA" },
+  { id: "4", name: "Flamant", hex: "#E67C73" },
+  { id: "5", name: "Banane", hex: "#F6BF26" },
+  { id: "6", name: "Mandarine", hex: "#F4511E" },
+  { id: "7", name: "Paon", hex: "#039BE5" },
+  { id: "8", name: "Graphite", hex: "#616161" },
+  { id: "9", name: "Myrtille", hex: "#3F51B5" },
+  { id: "10", name: "Basilic", hex: "#0B8043" },
+  { id: "11", name: "Tomate", hex: "#D50000" },
+];
+function cleaningSignature(c, property) {
+  const isArrival = c.type === "arrivee";
+  const duration = isArrival ? property?.keyHandoverDuration : property?.cleaningDuration;
+  return `${c.date}|${c.time}|${c.propertyId}|${c.status}|${c.notes || ""}|${property?.googleColorId || ""}|${duration || ""}|${c.type || "menage"}|v3`;
+}
+function cleaningEndDateTime(dateStr, timeStr, durationMinutes) {
+  const start = new Date(`${dateStr}T${timeStr}:00`);
+  const end = new Date(start.getTime() + durationMinutes * 60000);
+  const pad = (n) => String(n).padStart(2, "0");
+  return `${end.getFullYear()}-${pad(end.getMonth() + 1)}-${pad(end.getDate())}T${pad(end.getHours())}:${pad(end.getMinutes())}:00`;
+}
 function cleaningToEvent(cleaning, property) {
-  const time = cleaning.time || "11:00";
-  const [h, m] = time.split(":").map(Number);
-  const endH = Math.min(23, h + 2);
+  const isArrival = cleaning.type === "arrivee";
+  const time = cleaning.time || (isArrival ? "16:00" : "11:00");
+  const duration = (isArrival ? property?.keyHandoverDuration : property?.cleaningDuration) || (isArrival ? 30 : 120);
   return {
-    summary: `Ménage — ${property?.name || "Logement"}`,
+    summary: `${property?.name || "Logement"} — ${isArrival ? "Arrivée client" : "Ménage"}`,
     location: property?.address || "",
-    description: `Statut : ${STATUS[cleaning.status]?.label || cleaning.status}${cleaning.notes ? "\n" + cleaning.notes : ""}\nSynchronisé depuis Planning Ménage.`,
+    description: `Statut : ${STATUS[cleaning.status]?.label || cleaning.status}${isArrival && property?.keyHandoverPrice != null ? `\nPrix : ${property.keyHandoverPrice} €` : ""}${cleaning.notes ? "\n" + cleaning.notes : ""}\nSynchronisé depuis Planning Ménage.`,
     start: { dateTime: `${cleaning.date}T${time}:00`, timeZone: "Europe/Paris" },
-    end: { dateTime: `${cleaning.date}T${String(endH).padStart(2, "0")}:${String(m).padStart(2, "0")}:00`, timeZone: "Europe/Paris" },
+    end: { dateTime: cleaningEndDateTime(cleaning.date, time, duration), timeZone: "Europe/Paris" },
+    // La couleur choisie sur le logement s'applique par défaut ; une mission
+    // "à attribuer" reste signalée en violet (Raisin) quoi qu'il arrive, pour
+    // ne jamais perdre ce repère d'urgence.
+    ...(cleaning.status === "a_attribuer" ? { colorId: "3" } : property?.googleColorId ? { colorId: property.googleColorId } : {}),
   };
+}
+function formatDuration(minutes) {
+  const total = Math.max(0, Math.round(minutes || 0));
+  const h = Math.floor(total / 60), m = total % 60;
+  if (h === 0) return `${m}min`;
+  return m > 0 ? `${h}h${String(m).padStart(2, "0")}` : `${h}h`;
 }
 // Synchronise TOUS les ménages assignés à cette personne (passés et à venir)
 // vers son Google Agenda personnel. Crée / met à jour / retire les
@@ -443,9 +517,9 @@ async function syncMyCleanings(profile, cleanings, properties) {
   let created = 0, updated = 0, removed = 0;
 
   for (const c of mine) {
-    const sig = cleaningSignature(c);
-    const entry = ledger[c.id];
     const property = properties.find((p) => p.id === c.propertyId);
+    const sig = cleaningSignature(c, property);
+    const entry = ledger[c.id];
     if (!entry) {
       const ev = await gcalApi("POST", "/calendars/primary/events", token, cleaningToEvent(c, property));
       ledger[c.id] = { eventId: ev.id, sig };
@@ -479,6 +553,9 @@ function App() {
   const [cleanings, setCleanings] = useState([]);
   const [reservations, setReservations] = useState([]);
   const [tab, setTab] = useState("planning");
+  useEffect(() => {
+    if (tab === "stats" && profile?.role !== "owner") setTab("planning");
+  }, [tab, profile?.role]);
   const [error, setError] = useState("");
   const [offline, setOffline] = useState(false);
   const [showGCal, setShowGCal] = useState(false);
@@ -855,6 +932,10 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
   const dayCols = Array.from({ length: nDays }, (_, i) => i + 1);
   const monthStartISO = isoOf(year, month, 1);
   const nextMonthStartISO = isoOf(year, month + 1, 1);
+  const isDesktop = useIsDesktop();
+  const dayW = isDesktop ? 42 : DAY_W;
+  const labelW = isDesktop ? 150 : LABEL_W;
+  const scrollRef = useHorizontalScroll();
 
   const visibleCleanings = profile.role === "cleaner" ? cleanings.filter((c) => c.assignedToId === profile.id) : cleanings;
   const personOf = (id) => team.find((t) => t.id === id);
@@ -870,15 +951,15 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
         <p style={{ color: C.ink, fontFamily: "'Space Grotesk', sans-serif" }} className="text-sm font-semibold capitalize">{monthLabel}</p>
         <button onClick={() => setMonthOffset((m) => m + 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronRight" size={16} color={C.taupe} /></button>
       </div>
-      <div className="overflow-x-auto">
-        <div style={{ width: LABEL_W + nDays * DAY_W }}>
+      <div className="overflow-x-auto" ref={scrollRef} style={{ cursor: "grab" }}>
+        <div style={{ width: labelW + nDays * dayW }}>
           <div className="flex sticky top-0 z-10" style={{ background: "#FFFDF8" }}>
-            <div style={{ width: LABEL_W, borderColor: C.taupeLight }} className="shrink-0 border-b" />
+            <div style={{ width: labelW, borderColor: C.taupeLight }} className="shrink-0 border-b" />
             {dayCols.map((d) => {
               const weekend = isWeekend(year, month, d);
               const isToday = d === todayIdx;
               return (
-                <div key={d} style={{ width: DAY_W, background: isToday ? "#F3DCCF" : weekend ? "#00000006" : "transparent" }} className="shrink-0 text-center pt-1 pb-1.5 border-b">
+                <div key={d} style={{ width: dayW, background: isToday ? "#F3DCCF" : weekend ? "#00000006" : "transparent" }} className="shrink-0 text-center pt-1 pb-1.5 border-b">
                   <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[9px] font-semibold leading-none mb-0.5">{dayLetter(year, month, d)}</div>
                   <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[10px] leading-none">{d}</div>
                 </div>
@@ -889,22 +970,26 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
             const cleaningsForP = visibleCleanings.filter((c) => c.propertyId === p.id && c.date >= monthStartISO && c.date < nextMonthStartISO);
             return (
               <div key={p.id} className="flex border-b" style={{ borderColor: C.taupeLight }}>
-                <div style={{ width: LABEL_W, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
+                <div style={{ width: labelW, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
                   <span style={{ color: C.ink }} className="text-xs font-medium truncate">{p.name}</span>
                 </div>
-                <div style={{ width: nDays * DAY_W, position: "relative", minHeight: 44 }}>
+                <div style={{ width: nDays * dayW, position: "relative", minHeight: 44 }}>
                   {dayCols.filter((d) => isWeekend(year, month, d)).map((d) => (
-                    <div key={d} style={{ position: "absolute", left: (d - 1) * DAY_W, top: 0, bottom: 0, width: DAY_W, background: "#00000006" }} />
+                    <div key={d} style={{ position: "absolute", left: (d - 1) * dayW, top: 0, bottom: 0, width: dayW, background: "#00000006" }} />
                   ))}
                   {cleaningsForP.map((c) => {
                     const day = parseISO(c.date).getDate();
                     const s = STATUS[c.status] || STATUS.a_faire;
                     const person = personOf(c.assignedToId);
+                    const personColor = person?.color ? GCAL_COLORS.find((g) => g.id === person.color)?.hex : null;
+                    const isArrival = c.type === "arrivee";
                     return (
-                      <button key={c.id} onClick={() => onOpen(c.id)} title={`${p.name} · ${person?.name || "Non assigné"} · ${s.label}`}
-                        className="absolute top-2 rounded-md flex items-center justify-center"
-                        style={{ left: (day - 1) * DAY_W + 3, width: DAY_W - 6, height: 26, background: s.color }}>
-                        <span className="text-[10px] font-semibold" style={{ color: "#fff" }}>{(person?.name || "?").charAt(0).toUpperCase()}</span>
+                      <button key={c.id} onClick={() => onOpen(c.id)} title={`${p.name} · ${isArrival ? "Arrivée client" : "Ménage"} · ${person?.name || "Non assigné"} · ${s.label}`}
+                        className={`absolute top-2 flex items-center justify-center ${isArrival ? "rounded-full" : "rounded-md"}`}
+                        style={{ left: (day - 1) * dayW + 3, width: dayW - 6, height: 26, background: s.color, border: personColor ? `2.5px solid ${personColor}` : "2.5px solid transparent" }}>
+                        {isArrival ? <Icon name="key" size={12} color="#fff" /> : (
+                          <span className="text-[10px] font-semibold" style={{ color: "#fff" }}>{(person?.name || "?").charAt(0).toUpperCase()}</span>
+                        )}
                       </button>
                     );
                   })}
@@ -920,14 +1005,33 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
             <span style={{ width: 8, height: 8, borderRadius: 4, background: s.color, display: "inline-block" }} />{s.label}
           </span>
         ))}
+        <span className="flex items-center gap-1.5 text-[11px]" style={{ color: C.taupe }}>
+          <span style={{ width: 8, height: 8, borderRadius: 4, background: C.taupe, display: "inline-block" }} />Carré = ménage
+        </span>
+        <span className="flex items-center gap-1.5 text-[11px]" style={{ color: C.taupe }}>
+          <span style={{ width: 8, height: 8, borderRadius: 8, background: C.taupe, display: "inline-block" }} />Rond (🔑) = arrivée client
+        </span>
       </div>
+      {team.some((t) => t.color) && (
+        <div className="flex gap-3 px-3 pb-2.5 flex-wrap border-t pt-2.5" style={{ borderColor: C.taupeLight }}>
+          {team.filter((t) => t.color).map((t) => {
+            const gc = GCAL_COLORS.find((g) => g.id === t.color);
+            return (
+              <span key={t.id} className="flex items-center gap-1.5 text-[11px]" style={{ color: C.taupe }}>
+                <span style={{ width: 8, height: 8, borderRadius: 4, background: gc?.hex, display: "inline-block" }} />{t.name}
+              </span>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
 
 function DoorTagCard({ cleaning, property, person, onClick }) {
   const s = STATUS[cleaning.status] || STATUS.a_faire;
-  const total = property?.checklist?.length || 0;
+  const isArrival = cleaning.type === "arrivee";
+  const total = isArrival ? 0 : (property?.checklist?.length || 0);
   const done = Object.values(cleaning.checklistDone || {}).filter(Boolean).length;
   return (
     <button onClick={onClick} className="relative w-full text-left rounded-2xl overflow-hidden border" style={{ borderColor: C.taupeLight, background: "#FFFDF8" }}>
@@ -936,11 +1040,15 @@ function DoorTagCard({ cleaning, property, person, onClick }) {
         <div className="w-1.5" style={{ background: s.color }} />
         <div className="flex-1 px-4 py-3">
           <div className="flex items-center justify-between">
-            <h3 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="font-semibold text-[15px]">{property?.name || "Logement supprimé"}</h3>
+            <h3 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="font-semibold text-[15px] flex items-center gap-1.5">
+              {isArrival && <Icon name="key" size={13} color={C.violet} />}
+              {property?.name || "Logement supprimé"}
+            </h3>
             <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: s.bg, color: s.color }}>{s.label}</span>
           </div>
+          {isArrival && <p style={{ color: C.violet }} className="text-[10.5px] mt-0.5 font-medium">Arrivée client — remise de clés</p>}
           {cleaning.sourceReservationId && (
-            <p style={{ color: C.taupe }} className="text-[10.5px] mt-0.5">Généré automatiquement · départ client</p>
+            <p style={{ color: C.taupe }} className="text-[10.5px] mt-0.5">Généré automatiquement · {isArrival ? "arrivée client" : "départ client"}</p>
           )}
           <div style={{ color: C.taupe }} className="flex items-center gap-3 text-xs mt-1.5">
             <span className="flex items-center gap-1"><Icon name="calendar" size={12} /> {fmtDate(cleaning.date)}</span>
@@ -959,14 +1067,15 @@ function DoorTagCard({ cleaning, property, person, onClick }) {
 
 function NewCleaningForm({ properties, team, onClose, onCreate, initial }) {
   const [propertyId, setPropertyId] = useState(initial?.propertyId || properties[0]?.id || "");
+  const [type, setType] = useState(initial?.type || "menage");
   const [date, setDate] = useState(initial?.date || todayISO());
   const [time, setTime] = useState(initial?.time || "11:00");
   const [assignedToId, setAssignedToId] = useState(initial?.assignedToId || team[0]?.id || "");
   const submit = () => {
     if (!propertyId) return;
-    const data = { propertyId, date, time, assignedToId: assignedToId || null };
+    const data = { propertyId, type, date, time, assignedToId: assignedToId || null };
     if (initial) {
-      // édition : si on vient d'assigner quelqu'un à un ménage encore "à attribuer", il passe automatiquement à "à faire"
+      // édition : si on vient d'assigner quelqu'un à une mission encore "à attribuer", elle passe automatiquement à "à faire"
       if (assignedToId && initial.status === "a_attribuer") data.status = "a_faire";
     } else {
       data.status = assignedToId ? "a_faire" : "a_attribuer";
@@ -974,11 +1083,25 @@ function NewCleaningForm({ properties, team, onClose, onCreate, initial }) {
     onCreate(data);
   };
   return (
-    <Sheet onClose={onClose} title={initial ? "Modifier le ménage" : "Nouveau ménage"}>
+    <Sheet onClose={onClose} title={initial ? `Modifier ${type === "arrivee" ? "l'arrivée" : "le ménage"}` : "Nouvelle mission"}>
       {properties.length === 0 ? (
         <EmptyState icon="home" text="Ajoute d'abord un logement dans l'onglet Logements." />
       ) : (
         <div className="flex flex-col gap-4">
+          {!initial && (
+            <Field label="Type de mission">
+              <div className="grid grid-cols-2 gap-3">
+                <button onClick={() => setType("menage")} className="rounded-xl py-2.5 text-sm font-medium border transition"
+                  style={{ background: type === "menage" ? C.ink : "transparent", color: type === "menage" ? "#fff" : C.taupe, borderColor: C.ink }}>
+                  Ménage
+                </button>
+                <button onClick={() => setType("arrivee")} className="rounded-xl py-2.5 text-sm font-medium border transition flex items-center justify-center gap-1.5"
+                  style={{ background: type === "arrivee" ? C.violet : "transparent", color: type === "arrivee" ? "#fff" : C.violet, borderColor: C.violet }}>
+                  <Icon name="key" size={13} /> Arrivée client
+                </button>
+              </div>
+            </Field>
+          )}
           <Field label="Logement">
             <select value={propertyId} onChange={(e) => setPropertyId(e.target.value)} style={selectStyle}>
               {properties.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
@@ -1025,6 +1148,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const doneCount = checklist.filter((it) => doneMap[it.id]).length;
   const toggleItem = (itemId) => onUpdate({ checklistDone: { ...doneMap, [itemId]: !doneMap[itemId] } });
   const setStatus = (status) => onUpdate({ status });
+  const isArrival = cleaning.type === "arrivee";
 
   if (editing) {
     return (
@@ -1054,19 +1178,22 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const saveNotes = () => onUpdate({ notes });
 
   return (
-    <Sheet onClose={onClose} title={property?.name || "Ménage"}>
+    <Sheet onClose={onClose} title={`${isArrival ? "Arrivée client" : "Ménage"}${property?.name ? " — " + property.name : ""}`}>
       <div style={{ color: C.taupe }} className="flex items-center gap-3 text-sm mb-4">
         <span className="flex items-center gap-1"><Icon name="calendar" size={14} />{fmtDate(cleaning.date)}</span>
         <span className="flex items-center gap-1"><Icon name="clock" size={14} />{cleaning.time}</span>
       </div>
       {property?.address && <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-4"><Icon name="mapPin" size={14} /> {property.address}</p>}
+      {isArrival && property?.keyHandoverPrice != null && (
+        <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-4"><Icon name="key" size={14} /> Prix de cette mission : {property.keyHandoverPrice} €</p>
+      )}
       <div className="flex gap-2 mb-5">
         {Object.entries(STATUS).map(([key, s]) => (
           <button key={key} onClick={() => setStatus(key)} className="flex-1 py-2 rounded-lg text-xs font-semibold border"
             style={{ background: cleaning.status === key ? s.color : "transparent", color: cleaning.status === key ? "#fff" : s.color, borderColor: s.color }}>{s.label}</button>
         ))}
       </div>
-      {property && (
+      {!isArrival && property && (
         <div className="mb-5">
           <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Linge de ce logement</p>
           <div className="flex gap-2">
@@ -1104,45 +1231,49 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
         </div>
       )}
 
-      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Checklist ({doneCount}/{checklist.length})</p>
-      <div className="flex flex-col gap-2 mb-5">
-        {checklist.length === 0 && <p style={{ color: C.taupe }} className="text-sm">Ce logement n'a pas encore de checklist.</p>}
-        {checklist.map((item) => {
-          const checked = !!doneMap[item.id];
-          return (
-            <button key={item.id} onClick={() => toggleItem(item.id)} className="flex items-center gap-3 text-left px-3 py-2.5 rounded-xl" style={{ background: checked ? "#DDE7DF" : C.linenSoft }}>
-              <span className="flex items-center justify-center rounded-md shrink-0" style={{ width: 20, height: 20, background: checked ? C.sauge : "#fff", border: `1px solid ${checked ? C.sauge : C.taupeLight}` }}>
-                {checked && <Icon name="check" size={13} color="#fff" />}
-              </span>
-              <span style={{ color: C.ink, textDecoration: checked ? "line-through" : "none" }} className="text-sm">{item.text}</span>
-            </button>
-          );
-        })}
-      </div>
-      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Photos</p>
-      <div className="flex flex-wrap gap-2 mb-2">
-        {loadingPhotos ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : photos.map((src, i) => (
-          <div key={i} className="relative">
-            <img src={src} alt="" className="w-20 h-20 object-cover rounded-lg" />
-            <button onClick={() => removePhoto(i)} className="absolute -top-1.5 -right-1.5 rounded-full p-0.5" style={{ background: C.ink }}><Icon name="x" size={11} color="#fff" /></button>
+      {!isArrival && (
+        <>
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Checklist ({doneCount}/{checklist.length})</p>
+          <div className="flex flex-col gap-2 mb-5">
+            {checklist.length === 0 && <p style={{ color: C.taupe }} className="text-sm">Ce logement n'a pas encore de checklist.</p>}
+            {checklist.map((item) => {
+              const checked = !!doneMap[item.id];
+              return (
+                <button key={item.id} onClick={() => toggleItem(item.id)} className="flex items-center gap-3 text-left px-3 py-2.5 rounded-xl" style={{ background: checked ? "#DDE7DF" : C.linenSoft }}>
+                  <span className="flex items-center justify-center rounded-md shrink-0" style={{ width: 20, height: 20, background: checked ? C.sauge : "#fff", border: `1px solid ${checked ? C.sauge : C.taupeLight}` }}>
+                    {checked && <Icon name="check" size={13} color="#fff" />}
+                  </span>
+                  <span style={{ color: C.ink, textDecoration: checked ? "line-through" : "none" }} className="text-sm">{item.text}</span>
+                </button>
+              );
+            })}
           </div>
-        ))}
-        <label className="w-20 h-20 rounded-lg flex items-center justify-center border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
-          {uploading ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="camera" size={18} color={C.taupe} />}
-          <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
-        </label>
-      </div>
-      <p style={{ color: C.taupe }} className="text-xs mb-5">Les photos sont visibles par toute l'équipe.</p>
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Photos</p>
+          <div className="flex flex-wrap gap-2 mb-2">
+            {loadingPhotos ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : photos.map((src, i) => (
+              <div key={i} className="relative">
+                <img src={src} alt="" className="w-20 h-20 object-cover rounded-lg" />
+                <button onClick={() => removePhoto(i)} className="absolute -top-1.5 -right-1.5 rounded-full p-0.5" style={{ background: C.ink }}><Icon name="x" size={11} color="#fff" /></button>
+              </div>
+            ))}
+            <label className="w-20 h-20 rounded-lg flex items-center justify-center border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
+              {uploading ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="camera" size={18} color={C.taupe} />}
+              <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
+            </label>
+          </div>
+          <p style={{ color: C.taupe }} className="text-xs mb-5">Les photos sont visibles par toute l'équipe.</p>
+        </>
+      )}
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Notes</p>
       <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. clé sous le pot, interphone en panne…" rows={3}
         className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
       {profile.role === "owner" && (
         <div className="flex flex-col gap-2">
           <button onClick={() => setEditing(true)} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: C.linenSoft, color: C.ink }}>
-            <Icon name="pencil" size={15} /> Modifier ce ménage
+            <Icon name="pencil" size={15} /> Modifier {isArrival ? "cette arrivée" : "ce ménage"}
           </button>
           <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: "#F3DCCF", color: C.terracotta }}>
-            <Icon name="trash" size={15} /> Supprimer ce ménage
+            <Icon name="trash" size={15} /> Supprimer {isArrival ? "cette arrivée" : "ce ménage"}
           </button>
         </div>
       )}
@@ -1156,19 +1287,68 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
 const DAY_W = 30;
 const LABEL_W = 108;
 
+// Écran large (PC) : colonnes de jours un peu plus grandes pour la lisibilité.
+function useIsDesktop() {
+  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia("(min-width: 768px)").matches);
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 768px)");
+    const handler = () => setIsDesktop(mq.matches);
+    mq.addEventListener ? mq.addEventListener("change", handler) : mq.addListener(handler);
+    return () => (mq.removeEventListener ? mq.removeEventListener("change", handler) : mq.removeListener(handler));
+  }, []);
+  return isDesktop;
+}
+// Permet de faire défiler horizontalement à la molette de souris et de
+// glisser avec le clic maintenu — sur PC, il n'y a pas de doigt pour swiper,
+// et la molette seule ne défile que verticalement par défaut.
+function useHorizontalScroll() {
+  const ref = useRef(null);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    const onWheel = (e) => {
+      if (el.scrollWidth <= el.clientWidth) return;
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        el.scrollLeft += e.deltaY;
+      }
+    };
+    let dragging = false, startX = 0, startScroll = 0;
+    const onDown = (e) => { dragging = true; startX = e.pageX; startScroll = el.scrollLeft; el.style.cursor = "grabbing"; };
+    const onUp = () => { dragging = false; el.style.cursor = "grab"; };
+    const onMove = (e) => { if (!dragging) return; el.scrollLeft = startScroll - (e.pageX - startX); };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    el.addEventListener("mousedown", onDown);
+    window.addEventListener("mouseup", onUp);
+    window.addEventListener("mousemove", onMove);
+    return () => {
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("mousedown", onDown);
+      window.removeEventListener("mouseup", onUp);
+      window.removeEventListener("mousemove", onMove);
+    };
+  }, []);
+  return ref;
+}
+
 function OccupationTab({ profile, properties, reservations, saveReservations, cleanings, saveCleanings }) {
   const [monthOffset, setMonthOffset] = useState(0);
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [genMsg, setGenMsg] = useState("");
+  const isDesktop = useIsDesktop();
+  const dayW = isDesktop ? 42 : DAY_W;
+  const labelW = isDesktop ? 150 : LABEL_W;
+  const scrollRef = useHorizontalScroll();
+  const cardsScrollRef = useHorizontalScroll();
 
   const runGenerateMissing = async () => {
     setGenerating(true);
     setGenMsg("");
-    const added = await generateMissingCleanings(reservations, cleanings, saveCleanings);
+    const added = await generateMissingCleanings(reservations, properties, cleanings, saveCleanings);
     setGenerating(false);
-    setGenMsg(added > 0 ? `${added} ménage${added > 1 ? "s" : ""} créé${added > 1 ? "s" : ""}.` : "Tout est déjà à jour.");
+    setGenMsg(added > 0 ? `${added} mission${added > 1 ? "s" : ""} créée${added > 1 ? "s" : ""}.` : "Tout est déjà à jour.");
   };
 
   const now = new Date();
@@ -1240,7 +1420,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
             <p style={{ color: C.ink }} className="text-sm font-semibold">Taux de remplissage — {monthLabel}</p>
             <span style={{ fontFamily: "'IBM Plex Mono', monospace", color: pctColor(avgPct) }} className="text-sm font-semibold">{avgPct}% moy.</span>
           </div>
-          <div className="flex gap-2 overflow-x-auto pb-1">
+          <div className="flex gap-2 overflow-x-auto pb-1" ref={cardsScrollRef} style={{ cursor: "grab" }}>
             {occupancy.map(({ property, pct, nights }) => (
               <div key={property.id} className="shrink-0 rounded-xl px-3 py-2 min-w-[110px]" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
                 <p style={{ color: C.ink }} className="text-xs font-medium truncate">{property.name}</p>
@@ -1268,16 +1448,16 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
         <EmptyState icon="home" text="Ajoute un logement pour voir son planning de réservations." />
       ) : (
         <div className="rounded-2xl overflow-hidden border mb-6" style={{ borderColor: C.taupeLight, background: "#FFFDF8" }}>
-          <div className="overflow-x-auto">
-            <div style={{ width: LABEL_W + nDays * DAY_W }}>
+          <div className="overflow-x-auto" ref={scrollRef} style={{ cursor: "grab" }}>
+            <div style={{ width: labelW + nDays * dayW }}>
               {/* header jours */}
               <div className="flex sticky top-0 z-10" style={{ background: "#FFFDF8" }}>
-                <div style={{ width: LABEL_W, borderColor: C.taupeLight }} className="shrink-0 border-b" />
+                <div style={{ width: labelW, borderColor: C.taupeLight }} className="shrink-0 border-b" />
                 {dayCols.map((d) => {
                   const weekend = isWeekend(year, month, d);
                   const isToday = d === todayIdx;
                   return (
-                    <div key={d} style={{ width: DAY_W, background: isToday ? "#F3DCCF" : weekend ? "#00000006" : "transparent" }}
+                    <div key={d} style={{ width: dayW, background: isToday ? "#F3DCCF" : weekend ? "#00000006" : "transparent" }}
                       className="shrink-0 text-center pt-1 pb-1.5 border-b" >
                       <div style={{ color: isToday ? C.terracotta : C.taupe, fontFamily: "'IBM Plex Mono', monospace" }} className="text-[9px] font-semibold leading-none mb-0.5">
                         {dayLetter(year, month, d)}
@@ -1299,18 +1479,18 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
                 const turnoverDays = resForP.map((r) => r.checkIn).filter((d) => checkoutDays.has(d) && d >= monthStartISO && d <= monthEndISO);
                 return (
                   <div key={p.id} className="flex border-b" style={{ borderColor: C.taupeLight }}>
-                    <div style={{ width: LABEL_W, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
+                    <div style={{ width: labelW, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
                       <span style={{ color: C.ink }} className="text-xs font-medium truncate">{p.name}</span>
                     </div>
-                    <div style={{ width: nDays * DAY_W, position: "relative", minHeight: 44 }}>
+                    <div style={{ width: nDays * dayW, position: "relative", minHeight: 44 }}>
                       {dayCols.filter((d) => isWeekend(year, month, d)).map((d) => (
-                        <div key={d} style={{ position: "absolute", left: (d - 1) * DAY_W, top: 0, bottom: 0, width: DAY_W, background: "#00000006" }} />
+                        <div key={d} style={{ position: "absolute", left: (d - 1) * dayW, top: 0, bottom: 0, width: dayW, background: "#00000006" }} />
                       ))}
                       {turnoverDays.map((d) => {
                         const day = parseISO(d).getDate();
                         return (
                           <div key={"turnover-" + d} title="Départ et arrivée le même jour — ménage à organiser entre les deux"
-                            className="absolute top-0 bottom-0 pointer-events-none" style={{ left: (day - 1) * DAY_W, width: DAY_W, zIndex: 5 }}>
+                            className="absolute top-0 bottom-0 pointer-events-none" style={{ left: (day - 1) * dayW, width: dayW, zIndex: 5 }}>
                             <div className="w-full h-full" style={{ background: `repeating-linear-gradient(45deg, ${C.terracotta}33, ${C.terracotta}33 4px, transparent 4px, transparent 8px)`, borderLeft: `2px dashed ${C.terracotta}`, borderRight: `2px dashed ${C.terracotta}` }} />
                             <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 rounded-full flex items-center justify-center" style={{ width: 14, height: 14, background: C.terracotta }}>
                               <Icon name="alert" size={9} color="#fff" />
@@ -1331,13 +1511,13 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
                           <React.Fragment key={r.id}>
                             <button onClick={() => setOpenId(r.id)}
                               className="absolute top-2 rounded-md text-left px-1.5 flex items-center overflow-hidden"
-                              style={{ left: (startCol - 1) * DAY_W + 2, width: Math.max(DAY_W - 4, (endCol - startCol) * DAY_W - 4), height: 26, background: src.color }}>
+                              style={{ left: (startCol - 1) * dayW + 2, width: Math.max(dayW - 4, (endCol - startCol) * dayW - 4), height: 26, background: src.color }}>
                               <span className="text-[10px] font-medium truncate" style={{ color: "#fff" }}>{r.guestName}</span>
                             </button>
                             {departureVisible && (
                               <div onClick={() => setOpenId(r.id)} title="Jour de départ"
                                 className="absolute top-2 rounded-md cursor-pointer"
-                                style={{ left: (endCol - 1) * DAY_W + 2, width: DAY_W - 4, height: 26, background: src.color, opacity: 0.35 }} />
+                                style={{ left: (endCol - 1) * dayW + 2, width: dayW - 4, height: 26, background: src.color, opacity: 0.35 }} />
                             )}
                           </React.Fragment>
                         );
@@ -1368,7 +1548,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
             if (duplicate) { setShowForm(false); return; }
             const newRes = { id: uid(), ...data };
             await saveReservations([...reservations, newRes]);
-            await createLinkedCleaning(newRes, cleanings, saveCleanings);
+            await syncReservationMissions(newRes, properties.find((p) => p.id === newRes.propertyId), cleanings, saveCleanings);
             setShowForm(false);
           }} />
       )}
@@ -1378,7 +1558,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
           onUpdate={async (patch) => {
             const updated = { ...openReservation, ...patch };
             await saveReservations(reservations.map((r) => (r.id === openReservation.id ? updated : r)));
-            await syncLinkedCleaning(updated, cleanings, saveCleanings);
+            await syncReservationMissions(updated, properties.find((p) => p.id === updated.propertyId), cleanings, saveCleanings);
           }}
           onDelete={async () => {
             await handleReservationDeleted(openReservation, cleanings, saveCleanings);
@@ -1545,7 +1725,7 @@ function ProprietesTab({ profile, properties, saveProperties, cleanings, saveCle
       </div>
       {showForm && (
         <PropertyForm onClose={() => setShowForm(false)}
-          onCreate={async (data) => { await saveProperties([...properties, { id: uid(), ...data, checklist: DEFAULT_CHECKLIST.map((text) => ({ id: uid(), text })), linenStock: { clean: 0, dirty: 0, atLaundry: 0 }, kitPrice: 15 }]); setShowForm(false); }} />
+          onCreate={async (data) => { await saveProperties([...properties, { id: uid(), ...data, checklist: DEFAULT_CHECKLIST.map((text) => ({ id: uid(), text })), linenStock: { clean: 0, dirty: 0, atLaundry: 0 }, kitPrice: 15, cleaningDuration: 120, keyHandoverEnabled: false, keyHandoverPrice: 0, keyHandoverDuration: 30 }]); setShowForm(false); }} />
       )}
       {openProperty && (
         <PropertyDetail property={openProperty} profile={profile} cleanings={cleanings} saveCleanings={saveCleanings} reservations={reservations} saveReservations={saveReservations} onClose={() => setOpenId(null)}
@@ -1597,6 +1777,9 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const [notes, setNotes] = useState(property.notes || "");
   const [kitPrice, setKitPrice] = useState(property.kitPrice != null ? String(property.kitPrice) : "15");
   const [defaultCleaningPrice, setDefaultCleaningPrice] = useState(property.defaultCleaningPrice != null ? String(property.defaultCleaningPrice) : "");
+  const [cleaningDuration, setCleaningDuration] = useState(property.cleaningDuration != null ? String(property.cleaningDuration) : "120");
+  const [keyHandoverPrice, setKeyHandoverPrice] = useState(property.keyHandoverPrice != null ? String(property.keyHandoverPrice) : "");
+  const [keyHandoverDuration, setKeyHandoverDuration] = useState(property.keyHandoverDuration != null ? String(property.keyHandoverDuration) : "30");
   const [icalUrl, setIcalUrl] = useState(property.icalUrl || "");
   const [icsPaste, setIcsPaste] = useState("");
   const [syncing, setSyncing] = useState(false);
@@ -1607,7 +1790,12 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const saveNotes = () => onUpdate({ notes });
   const saveKitPrice = () => onUpdate({ kitPrice: Number(kitPrice) || 0 });
   const saveDefaultCleaningPrice = () => onUpdate({ defaultCleaningPrice: defaultCleaningPrice.trim() === "" ? null : Number(defaultCleaningPrice) });
+  const saveCleaningDuration = () => onUpdate({ cleaningDuration: Math.max(15, Number(cleaningDuration) || 120) });
+  const toggleKeyHandover = () => onUpdate({ keyHandoverEnabled: !property.keyHandoverEnabled });
+  const saveKeyHandoverPrice = () => onUpdate({ keyHandoverPrice: Number(keyHandoverPrice) || 0 });
+  const saveKeyHandoverDuration = () => onUpdate({ keyHandoverDuration: Math.max(5, Number(keyHandoverDuration) || 30) });
   const saveIcalUrl = () => onUpdate({ icalUrl: icalUrl.trim() });
+  const setGoogleColor = (colorId) => onUpdate({ googleColorId: property.googleColorId === colorId ? null : colorId });
 
   const runSync = async () => {
     if (!icalUrl.trim()) return;
@@ -1617,7 +1805,7 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
       const res = await fetch(icalUrl.trim());
       if (!res.ok) throw new Error("http");
       const text = await res.text();
-      const count = await syncFromICS(text, property.id, reservations, saveReservations, cleanings, saveCleanings);
+      const count = await syncFromICS(text, property, reservations, saveReservations, cleanings, saveCleanings);
       setSyncMsg(count > 0 ? `${count} réservation${count > 1 ? "s" : ""} importée${count > 1 ? "s" : ""}.` : "Aucune nouvelle réservation à importer.");
     } catch (err) {
       setSyncMsg("Synchronisation automatique impossible depuis le navigateur (souvent bloquée par le site source). Utilise le collage manuel juste en dessous à la place.");
@@ -1628,7 +1816,7 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
     if (!icsPaste.trim()) return;
     setSyncing(true);
     setSyncMsg("");
-    const count = await syncFromICS(icsPaste, property.id, reservations, saveReservations, cleanings, saveCleanings);
+    const count = await syncFromICS(icsPaste, property, reservations, saveReservations, cleanings, saveCleanings);
     setSyncMsg(count > 0 ? `${count} réservation${count > 1 ? "s" : ""} importée${count > 1 ? "s" : ""}.` : "Aucune nouvelle réservation trouvée dans ce texte.");
     setSyncing(false);
     setIcsPaste("");
@@ -1716,6 +1904,39 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
         </Field>
       )}
       <p style={{ color: C.taupe }} className="text-xs mt-1.5 mb-2">Ce prix s'applique automatiquement à chaque réservation de ce logement. Sur une réservation précise, tu peux saisir un prix différent (ménage exceptionnellement plus long) — il sera alors utilisé à la place du prix normal.</p>
+      <div className="h-3" />
+      {isOwner && (
+        <Field label="Durée moyenne d'un ménage pour ce logement (minutes)">
+          <input type="number" min="15" step="15" value={cleaningDuration} onChange={(e) => setCleaningDuration(e.target.value)} onBlur={saveCleaningDuration} placeholder="Ex. 120" style={selectStyle} />
+        </Field>
+      )}
+      <p style={{ color: C.taupe }} className="text-xs mt-1.5 mb-2">
+        Sert à calculer la longueur du créneau dans Google Agenda, et le temps de ménage total dans les statistiques (par personne et par logement). {cleaningDuration && `Actuellement : ${formatDuration(Number(cleaningDuration))} par ménage.`}
+      </p>
+
+      {isOwner && (
+        <div className="mb-5">
+          <button onClick={toggleKeyHandover} className="flex items-center gap-3 w-full text-left mb-3">
+            <span className="flex items-center justify-center rounded-md shrink-0" style={{ width: 22, height: 22, background: property.keyHandoverEnabled ? C.sauge : "#fff", border: `1px solid ${property.keyHandoverEnabled ? C.sauge : C.taupeLight}` }}>
+              {property.keyHandoverEnabled && <Icon name="check" size={14} color="#fff" />}
+            </span>
+            <span style={{ color: C.ink }} className="text-sm font-semibold">Proposer la remise de clés en main propre pour ce logement</span>
+          </button>
+          {property.keyHandoverEnabled && (
+            <div className="pl-8 flex flex-col gap-3">
+              <Field label="Prix de la remise de clés (€)">
+                <input type="number" min="0" step="1" value={keyHandoverPrice} onChange={(e) => setKeyHandoverPrice(e.target.value)} onBlur={saveKeyHandoverPrice} placeholder="Ex. 20" style={selectStyle} />
+              </Field>
+              <Field label="Durée moyenne d'une remise de clés (minutes)">
+                <input type="number" min="5" step="5" value={keyHandoverDuration} onChange={(e) => setKeyHandoverDuration(e.target.value)} onBlur={saveKeyHandoverDuration} placeholder="Ex. 30" style={selectStyle} />
+              </Field>
+              <p style={{ color: C.taupe }} className="text-xs">
+                Une mission "Arrivée client" sera créée automatiquement à la date d'arrivée de chaque réservation de ce logement, en plus du ménage au départ. Elle apparaît dans le planning Ménage et peut être attribuée à quelqu'un de l'équipe.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       <p style={{ color: C.ink, marginTop: 20 }} className="text-sm font-semibold mb-2">Checklist de ménage</p>
       <div className="flex flex-col gap-2 mb-3">
@@ -1730,6 +1951,27 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
         <div className="flex gap-2 mb-6">
           <input value={newItem} onChange={(e) => setNewItem(e.target.value)} placeholder="Ajouter une tâche" className="flex-1 px-3 py-2 rounded-xl text-sm outline-none" style={{ background: C.linenSoft, color: C.ink }} onKeyDown={(e) => e.key === "Enter" && addItem()} />
           <button onClick={addItem} className="px-4 rounded-xl" style={{ background: C.ink }}><Icon name="plus" size={16} color={C.linen} /></button>
+        </div>
+      )}
+
+      {isOwner && (
+        <div className="mb-5">
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Couleur sur Google Agenda</p>
+          <div className="grid grid-cols-6 gap-2 mb-1">
+            {GCAL_COLORS.map((c) => {
+              const active = property.googleColorId === c.id;
+              return (
+                <button key={c.id} onClick={() => setGoogleColor(c.id)} title={c.name}
+                  className="aspect-square rounded-full flex items-center justify-center"
+                  style={{ background: c.hex, border: active ? `3px solid ${C.ink}` : "3px solid transparent" }}>
+                  {active && <Icon name="check" size={13} color="#fff" />}
+                </button>
+              );
+            })}
+          </div>
+          <p style={{ color: C.taupe }} className="text-xs">
+            {property.googleColorId ? `Couleur choisie : ${GCAL_COLORS.find((c) => c.id === property.googleColorId)?.name} — tape à nouveau dessus pour l'enlever.` : "Aucune couleur choisie : les ménages de ce logement garderont la couleur par défaut de l'agenda (sauf s'ils sont \"à attribuer\", toujours en violet)."}
+          </p>
         </div>
       )}
 
@@ -1790,7 +2032,7 @@ function StatRow({ left, right, color, last }) {
 
 // Génère et télécharge un fichier Excel (.xlsx) reprenant toutes les
 // données affichées sur la page Statistiques pour le mois consulté.
-function exportStatsToExcel({ monthLabel, occupancy, byPerson, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf }) {
+function exportStatsToExcel({ monthLabel, occupancy, byPerson, timeByPerson, timeByProperty, arriveeByPerson, arriveeByProperty, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf }) {
   const wb = XLSX.utils.book_new();
 
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
@@ -1800,6 +2042,22 @@ function exportStatsToExcel({ monthLabel, occupancy, byPerson, late, revenueByPr
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
     byPerson.map((b) => ({ Personne: b.person.name, "Ménages ce mois-ci": b.total, "Dont terminés": b.done }))
   ), "Équipe");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    timeByPerson.map((t) => ({ Personne: t.person.name, "Ménages terminés": t.count, "Temps total (min)": t.minutes, "Temps total": formatDuration(t.minutes) }))
+  ), "Temps par personne");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    timeByProperty.map((t) => ({ Logement: t.property.name, "Ménages terminés": t.count, "Temps total (min)": t.minutes, "Temps total": formatDuration(t.minutes) }))
+  ), "Temps par logement");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    arriveeByPerson.map((a) => ({ Personne: a.person.name, "Arrivées terminées": a.count, "Temps total": formatDuration(a.minutes), "Montant (€)": a.amount }))
+  ), "Arrivées par personne");
+
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    arriveeByProperty.map((a) => ({ Logement: a.property.name, "Arrivées terminées": a.count, "Temps total": formatDuration(a.minutes), "Montant (€)": a.amount }))
+  ), "Arrivées par logement");
 
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
     late.map((c) => ({
@@ -1837,6 +2095,8 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
   const nextMonthStartISO = isoOf(year, month + 1, 1);
 
   const cleaningsThisMonth = cleanings.filter((c) => c.date >= monthStartISO && c.date < nextMonthStartISO);
+  const menageThisMonth = cleaningsThisMonth.filter((c) => (c.type || "menage") === "menage");
+  const arriveeThisMonth = cleaningsThisMonth.filter((c) => c.type === "arrivee");
   const pctColor = (pct) => (pct < 40 ? C.terracotta : pct < 70 ? C.or : C.sauge);
 
   const occupancy = properties.map((p) => {
@@ -1848,10 +2108,42 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
   const avgPct = occupancy.length ? Math.round(occupancy.reduce((s, o) => s + o.pct, 0) / occupancy.length) : 0;
 
   const byPerson = team.map((t) => {
-    const list = cleaningsThisMonth.filter((c) => c.assignedToId === t.id);
+    const list = menageThisMonth.filter((c) => c.assignedToId === t.id);
     const done = list.filter((c) => c.status === "termine").length;
     return { person: t, total: list.length, done };
   }).filter((x) => x.total > 0).sort((a, b) => b.total - a.total);
+
+  // Temps de ménage réalisé (basé sur la durée définie par logement, comptée
+  // uniquement pour les ménages marqués "Terminé" ce mois-ci). Les missions
+  // d'arrivée client sont comptées séparément plus bas.
+  const durationOf = (c) => (properties.find((p) => p.id === c.propertyId)?.cleaningDuration || 120);
+  const doneThisMonth = menageThisMonth.filter((c) => c.status === "termine");
+  const timeByPerson = team.map((t) => {
+    const list = doneThisMonth.filter((c) => c.assignedToId === t.id);
+    const minutes = list.reduce((s, c) => s + durationOf(c), 0);
+    return { person: t, minutes, count: list.length };
+  }).filter((x) => x.count > 0).sort((a, b) => b.minutes - a.minutes);
+  const totalTimeMinutes = timeByPerson.reduce((s, x) => s + x.minutes, 0);
+
+  const timeByProperty = properties.map((p) => {
+    const list = doneThisMonth.filter((c) => c.propertyId === p.id);
+    return { property: p, minutes: list.length * (p.cleaningDuration || 120), count: list.length };
+  }).filter((x) => x.count > 0).sort((a, b) => b.minutes - a.minutes);
+
+  // Missions "Arrivée client" (remise de clés) — temps, montant à facturer et
+  // décompte, par personne et par logement, ce mois-ci.
+  const arriveeDone = arriveeThisMonth.filter((c) => c.status === "termine");
+  const arriveeByPerson = team.map((t) => {
+    const list = arriveeDone.filter((c) => c.assignedToId === t.id);
+    const minutes = list.reduce((s, c) => s + (properties.find((p) => p.id === c.propertyId)?.keyHandoverDuration || 30), 0);
+    const amount = list.reduce((s, c) => s + (properties.find((p) => p.id === c.propertyId)?.keyHandoverPrice || 0), 0);
+    return { person: t, count: list.length, minutes, amount };
+  }).filter((x) => x.count > 0).sort((a, b) => b.count - a.count);
+  const arriveeByProperty = properties.filter((p) => p.keyHandoverEnabled).map((p) => {
+    const list = arriveeDone.filter((c) => c.propertyId === p.id);
+    return { property: p, count: list.length, minutes: list.length * (p.keyHandoverDuration || 30), amount: list.length * (p.keyHandoverPrice || 0) };
+  }).filter((x) => x.count > 0).sort((a, b) => b.count - a.count);
+  const totalArriveeAmount = arriveeByPerson.reduce((s, x) => s + x.amount, 0);
 
   const late = cleanings.filter((c) => c.date < todayISO() && c.status !== "termine").sort((a, b) => a.date.localeCompare(b.date));
 
@@ -1893,7 +2185,7 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
   const openLate = openLateId ? cleanings.find((c) => c.id === openLateId) : null;
   const doExport = () => {
     try {
-      exportStatsToExcel({ monthLabel, occupancy, byPerson, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf });
+      exportStatsToExcel({ monthLabel, occupancy, byPerson, timeByPerson, timeByProperty, arriveeByPerson, arriveeByProperty, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf });
     } catch (e) {}
   };
 
@@ -1939,6 +2231,52 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
               <StatRow key={x.person.id} left={x.person.name} right={`${x.done}/${x.total} terminés`} last={i === byPerson.length - 1} />
             ))}
           </StatSection>
+
+          <StatSection title="Temps de ménage par personne ce mois-ci">
+            {timeByPerson.length === 0 ? (
+              <p style={{ color: C.taupe }} className="text-xs py-2">Aucun ménage terminé ce mois-ci.</p>
+            ) : (
+              <>
+                {timeByPerson.map((x) => (
+                  <StatRow key={x.person.id} left={x.person.name} right={`${formatDuration(x.minutes)} (${x.count} ménage${x.count !== 1 ? "s" : ""})`} />
+                ))}
+                <StatRow left="Total" right={formatDuration(totalTimeMinutes)} color={C.ink} last />
+              </>
+            )}
+          </StatSection>
+
+          <StatSection title="Temps de ménage par logement ce mois-ci">
+            {timeByProperty.length === 0 ? (
+              <p style={{ color: C.taupe }} className="text-xs py-2">Aucun ménage terminé ce mois-ci.</p>
+            ) : timeByProperty.map((x, i) => (
+              <StatRow key={x.property.id} left={x.property.name} right={`${formatDuration(x.minutes)} (${x.count} ménage${x.count !== 1 ? "s" : ""})`} last={i === timeByProperty.length - 1} />
+            ))}
+          </StatSection>
+
+          {(arriveeByPerson.length > 0 || arriveeByProperty.length > 0) && (
+            <>
+              <StatSection title="Arrivées client (remise de clés) par personne ce mois-ci">
+                {arriveeByPerson.length === 0 ? (
+                  <p style={{ color: C.taupe }} className="text-xs py-2">Aucune arrivée terminée ce mois-ci.</p>
+                ) : (
+                  <>
+                    {arriveeByPerson.map((x) => (
+                      <StatRow key={x.person.id} left={x.person.name} right={`${x.count} · ${formatDuration(x.minutes)} · ${x.amount.toFixed(0)} €`} />
+                    ))}
+                    <StatRow left="Total à verser/facturer" right={`${totalArriveeAmount.toFixed(0)} €`} color={C.violet} last />
+                  </>
+                )}
+              </StatSection>
+
+              <StatSection title="Arrivées client par logement ce mois-ci">
+                {arriveeByProperty.length === 0 ? (
+                  <p style={{ color: C.taupe }} className="text-xs py-2">Aucune arrivée terminée ce mois-ci.</p>
+                ) : arriveeByProperty.map((x, i) => (
+                  <StatRow key={x.property.id} left={x.property.name} right={`${x.count} · ${x.amount.toFixed(0)} €`} last={i === arriveeByProperty.length - 1} />
+                ))}
+              </StatSection>
+            </>
+          )}
 
           <StatSection title={`Ménages en retard (${late.length})`}>
             {late.length === 0 ? (
@@ -2001,15 +2339,16 @@ function EquipeTab({ team, profile, saveTeam, cleanings, saveCleanings, onSelfDe
       <div className="flex flex-col gap-2">
         {team.map((t) => {
           const Wrapper = isOwner ? "button" : "div";
+          const gcalColor = GCAL_COLORS.find((c) => c.id === t.color);
           return (
             <Wrapper key={t.id} onClick={isOwner ? () => setOpenId(t.id) : undefined}
               className="w-full text-left flex items-center gap-3 px-4 py-3 rounded-2xl" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
-              <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 36, height: 36, background: t.role === "owner" ? C.terracotta : C.sauge, color: "#fff", fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
+              <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 36, height: 36, background: gcalColor ? gcalColor.hex : (t.role === "owner" ? C.terracotta : C.sauge), color: "#fff", fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
                 {t.name.charAt(0).toUpperCase()}
               </div>
               <div className="flex-1">
                 <p style={{ color: C.ink }} className="text-sm font-medium">{t.name} {t.id === profile.id && <span style={{ color: C.taupe }}>(toi)</span>}</p>
-                <p style={{ color: C.taupe }} className="text-xs">{t.role === "owner" ? "Propriétaire" : "Équipe de ménage"}</p>
+                <p style={{ color: C.taupe }} className="text-xs">{t.role === "owner" ? "Propriétaire" : "Équipe de ménage"}{gcalColor ? ` · ${gcalColor.name}` : ""}</p>
               </div>
               {isOwner && <Icon name="chevronRight" size={18} color={C.taupe} />}
             </Wrapper>
@@ -2019,7 +2358,7 @@ function EquipeTab({ team, profile, saveTeam, cleanings, saveCleanings, onSelfDe
       <p style={{ color: C.taupe }} className="text-xs mt-5">Une personne rejoint automatiquement l'équipe en ouvrant l'appli et en choisissant son prénom et son rôle.</p>
 
       {openMember && (
-        <MemberDetail member={openMember} isSelf={openMember.id === profile.id} onClose={() => setOpenId(null)}
+        <MemberDetail member={openMember} team={team} isSelf={openMember.id === profile.id} onClose={() => setOpenId(null)}
           onUpdate={async (patch) => { await saveTeam(team.map((t) => (t.id === openMember.id ? { ...t, ...patch } : t))); setOpenId(null); }}
           onDelete={async () => {
             await saveTeam(team.filter((t) => t.id !== openMember.id));
@@ -2032,9 +2371,15 @@ function EquipeTab({ team, profile, saveTeam, cleanings, saveCleanings, onSelfDe
   );
 }
 
-function MemberDetail({ member, isSelf, onClose, onUpdate, onDelete }) {
+function MemberDetail({ member, team, isSelf, onClose, onUpdate, onDelete }) {
   const [name, setName] = useState(member.name);
   const [role, setRole] = useState(member.role);
+  const [color, setColorState] = useState(member.color || null);
+  const takenColorIds = team.filter((t) => t.id !== member.id && t.color).map((t) => t.color);
+  const pickColor = (colorId) => {
+    if (takenColorIds.includes(colorId)) return;
+    setColorState(color === colorId ? null : colorId);
+  };
   return (
     <Sheet onClose={onClose} title="Modifier le profil">
       <Field label="Prénom">
@@ -2053,7 +2398,24 @@ function MemberDetail({ member, isSelf, onClose, onUpdate, onDelete }) {
           </button>
         </div>
       </Field>
-      <button disabled={!name.trim()} onClick={() => onUpdate({ name: name.trim(), role })} className="w-full py-3 rounded-xl font-medium mt-5 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+      <div className="h-3" />
+      <Field label="Couleur (planning Ménage & Google Agenda)">
+        <div className="grid grid-cols-6 gap-2 mb-1 mt-1.5">
+          {GCAL_COLORS.map((c) => {
+            const active = color === c.id;
+            const takenByOther = takenColorIds.includes(c.id);
+            return (
+              <button key={c.id} onClick={() => pickColor(c.id)} disabled={takenByOther} title={takenByOther ? `${c.name} — déjà prise` : c.name}
+                className="aspect-square rounded-full flex items-center justify-center disabled:opacity-25 disabled:cursor-not-allowed"
+                style={{ background: c.hex, border: active ? `3px solid ${C.ink}` : "3px solid transparent" }}>
+                {active && <Icon name="check" size={13} color="#fff" />}
+              </button>
+            );
+          })}
+        </div>
+        <p style={{ color: C.taupe }} className="text-xs">Chaque couleur ne peut être prise que par une seule personne. Les couleurs grisées sont déjà utilisées.</p>
+      </Field>
+      <button disabled={!name.trim()} onClick={() => onUpdate({ name: name.trim(), role, color })} className="w-full py-3 rounded-xl font-medium mt-5 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
         Enregistrer
       </button>
       {isSelf && <p style={{ color: C.taupe }} className="text-xs mt-3">C'est ton propre profil.</p>}
