@@ -17,7 +17,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://unpkg.com/[email protected]/dist/xlsx.full.min.js"></script>
-<script src="https://unpkg.com/[email protected]/build/index.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/[email protected]/build/index.umd.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -1298,6 +1298,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const [notes, setNotes] = useState(cleaning.notes || "");
   const [editing, setEditing] = useState(false);
   const [generatingReport, setGeneratingReport] = useState(false);
+  const [reportMsg, setReportMsg] = useState("");
   const [sharing, setSharing] = useState(false);
   const [shareMsg, setShareMsg] = useState("");
 
@@ -1454,12 +1455,23 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
         className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
 
       <button
-        onClick={async () => { setGeneratingReport(true); try { await generateCleaningReport(cleaning, property, person, photos); } catch (e) {} setGeneratingReport(false); }}
+        onClick={async () => {
+          setGeneratingReport(true); setReportMsg("");
+          try {
+            if (!window.docx) throw new Error("La bibliothèque de génération Word ne s'est pas chargée (connexion internet ou bloqueur de script). Réessaie dans quelques secondes ou vérifie ta connexion.");
+            await generateCleaningReport(cleaning, property, person, photos);
+          } catch (e) {
+            console.error("Erreur génération rapport :", e);
+            setReportMsg(e?.message || "La génération du rapport a échoué. Réessaie, ou préviens-moi avec le détail affiché dans la console (F12) si ça persiste.");
+          }
+          setGeneratingReport(false);
+        }}
         disabled={generatingReport}
         className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm mb-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
         {generatingReport ? <div className="animate-spin"><Icon name="loader" size={15} /></div> : <Icon name="download" size={15} />}
         Générer le rapport de passage (Word)
       </button>
+      {reportMsg && <p style={{ color: C.terracotta }} className="text-xs mb-3">{reportMsg}</p>}
       <p style={{ color: C.taupe }} className="text-xs mb-5">Inclut les informations d'entreprise de {person?.name || "la personne assignée"}, le logement, la checklist et les photos prises.</p>
 
       {profile.role === "owner" && (
