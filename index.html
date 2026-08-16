@@ -17,6 +17,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://unpkg.com/[email protected]/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/[email protected]/build/index.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -303,6 +304,8 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     camera: "M4 8h3l2-2h6l2 2h3v11H4V8Z M12 12a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Z",
     chevronRight: "M9 5l7 7-7 7",
     chevronLeft: "M15 5l-7 7 7 7",
+    chevronUp: "M6 15l6-6 6 6",
+    chevronDown: "M6 9l6 6 6-6",
     trash: "M4 7h16 M9 7V4h6v3 M6 7l1 13h10l1-13",
     mapPin: "M12 21s7-6.5 7-12a7 7 0 1 0-14 0c0 5.5 7 12 7 12Z M12 11.5a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z",
     alert: "M12 3 2 20h20L12 3Z M12 10v4 M12 17h.01",
@@ -314,6 +317,7 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     pencil: "M4 20h4L18.5 9.5a2 2 0 0 0-4-4L4 16v4Z",
     phone: "M5 4h4l2 5-2.5 1.5a11 11 0 0 0 5 5L15 13l5 2v4a2 2 0 0 1-2 2A16 16 0 0 1 3 6a2 2 0 0 1 2-2Z",
     download: "M12 4v11 M7.5 11 12 15.5 16.5 11 M4 19h16",
+    share: "M18 8a3 3 0 1 0-2.83-4 M6 12a3 3 0 1 0 0 0 M18 20a3 3 0 1 0-2.83-4 M8.6 10.5l6.8-3.8 M8.6 13.5l6.8 3.8",
     key: "M15 7a4 4 0 1 0-3.9 4H15l2 2 2-2 2 2 2-2-2-2h-4.1",
   };
   return (
@@ -386,6 +390,29 @@ function compressImage(file, maxW = 700, quality = 0.55) {
     reader.onerror = reject;
     reader.readAsDataURL(file);
   });
+}
+
+// Partage les photos d'un ménage via le menu de partage natif du téléphone
+// (WhatsApp, Messages, email...). Repose sur la Web Share API — disponible
+// sur la plupart des navigateurs mobiles, pas forcément sur ordinateur.
+async function shareCleaningPhotos(photos, property) {
+  if (!photos || photos.length === 0) return { ok: false, reason: "no-photos" };
+  try {
+    const files = await Promise.all(photos.map(async (src, i) => {
+      const res = await fetch(src);
+      const blob = await res.blob();
+      const filename = `menage-${property?.name || "logement"}-${i + 1}.jpg`.replace(/\s+/g, "-");
+      return new File([blob], filename, { type: "image/jpeg" });
+    }));
+    if (navigator.canShare && navigator.canShare({ files })) {
+      await navigator.share({ files, title: `Photos — ${property?.name || "logement"}`, text: `Photos du ménage — ${property?.name || "logement"}` });
+      return { ok: true };
+    }
+    return { ok: false, reason: "not-supported" };
+  } catch (e) {
+    if (e?.name === "AbortError") return { ok: false, reason: "cancelled" };
+    return { ok: false, reason: "error" };
+  }
 }
 
 /* ---------------------------------------------------------
@@ -506,6 +533,134 @@ function formatDuration(minutes) {
   if (h === 0) return `${m}min`;
   return m > 0 ? `${h}h${String(m).padStart(2, "0")}` : `${h}h`;
 }
+
+/* ---------------------------------------------------------
+   RAPPORT DE PASSAGE (Word) — preuve d'intervention à valeur
+   juridique : infos de l'intervenant (entreprise), du logement,
+   de la mission, checklist réalisée et photos prises sur place.
+--------------------------------------------------------- */
+function dataUrlToUint8Array(dataUrl) {
+  const base64 = dataUrl.split(",")[1] || dataUrl;
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+function reportInfoRow(label, value) {
+  const { TableRow, TableCell, Paragraph, TextRun, WidthType } = docx;
+  return new TableRow({
+    children: [
+      new TableCell({
+        width: { size: 28, type: WidthType.PERCENTAGE },
+        shading: { fill: "F6F2E9" },
+        children: [new Paragraph({ children: [new TextRun({ text: label, bold: true, size: 20 })] })],
+      }),
+      new TableCell({
+        width: { size: 72, type: WidthType.PERCENTAGE },
+        children: [new Paragraph({ children: [new TextRun({ text: String(value || "—"), size: 20 })] })],
+      }),
+    ],
+  });
+}
+async function generateCleaningReport(cleaning, property, person, photos) {
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, ImageRun, AlignmentType, BorderStyle } = docx;
+  const isArrival = cleaning.type === "arrivee";
+  const children = [];
+
+  children.push(new Paragraph({
+    children: [new TextRun({ text: "Rapport de passage", bold: true, size: 40, color: "20261F" })],
+    spacing: { after: 80 },
+  }));
+  children.push(new Paragraph({
+    children: [new TextRun({ text: isArrival ? "Arrivée client — remise de clés" : "Ménage", size: 24, color: "7C6B9C", bold: true })],
+    spacing: { after: 240 },
+  }));
+
+  // Intervenant / entreprise
+  children.push(new Paragraph({ text: "Intervenant", heading: HeadingLevel.HEADING_3, spacing: { after: 100 } }));
+  const introRows = [reportInfoRow("Nom", person?.name || "Non assigné")];
+  if (person?.companyName) introRows.push(reportInfoRow("Entreprise", person.companyName));
+  if (person?.siret) introRows.push(reportInfoRow("SIRET", person.siret));
+  if (person?.companyAddress) introRows.push(reportInfoRow("Adresse", person.companyAddress));
+  if (person?.companyPhone) introRows.push(reportInfoRow("Téléphone", person.companyPhone));
+  if (person?.companyEmail) introRows.push(reportInfoRow("Email", person.companyEmail));
+  children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: introRows }));
+
+  // Mission
+  children.push(new Paragraph({ text: "Détails de la mission", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
+  children.push(new Table({
+    width: { size: 100, type: WidthType.PERCENTAGE },
+    rows: [
+      reportInfoRow("Logement", property?.name),
+      reportInfoRow("Adresse", property?.address),
+      reportInfoRow("Type de mission", isArrival ? "Arrivée client (remise de clés)" : "Ménage"),
+      reportInfoRow("Date", fmtDate(cleaning.date)),
+      reportInfoRow("Heure", cleaning.time),
+      reportInfoRow("Statut", STATUS[cleaning.status]?.label || cleaning.status),
+      ...(isArrival && property?.keyHandoverPrice != null ? [reportInfoRow("Prix de la mission", `${property.keyHandoverPrice} €`)] : []),
+    ],
+  }));
+
+  // Checklist (ménage uniquement)
+  if (!isArrival) {
+    const checklist = property?.checklist || [];
+    const doneMap = cleaning.checklistDone || {};
+    children.push(new Paragraph({ text: "Checklist réalisée", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
+    if (checklist.length === 0) {
+      children.push(new Paragraph({ children: [new TextRun({ text: "Aucune checklist définie pour ce logement.", italics: true, size: 20 })] }));
+    } else {
+      checklist.forEach((item) => {
+        const checked = !!doneMap[item.id];
+        children.push(new Paragraph({
+          children: [new TextRun({ text: `${checked ? "☑" : "☐"}  ${item.text}`, size: 20, color: checked ? "20261F" : "9C9284" })],
+          spacing: { after: 40 },
+        }));
+      });
+    }
+  }
+
+  // Notes
+  if (cleaning.notes) {
+    children.push(new Paragraph({ text: "Notes", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
+    children.push(new Paragraph({ children: [new TextRun({ text: cleaning.notes, size: 20 })] }));
+  }
+
+  // Photos (déjà stockées par l'appli pour ce ménage)
+  children.push(new Paragraph({ text: "Photos prises sur place", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
+  if (!photos || photos.length === 0) {
+    children.push(new Paragraph({ children: [new TextRun({ text: "Aucune photo jointe à cette mission.", italics: true, size: 20 })] }));
+  } else {
+    for (const src of photos) {
+      try {
+        const bytes = dataUrlToUint8Array(src);
+        children.push(new Paragraph({
+          children: [new ImageRun({ data: bytes, transformation: { width: 380, height: 285 } })],
+          spacing: { after: 200 },
+        }));
+      } catch (e) {}
+    }
+  }
+
+  children.push(new Paragraph({
+    children: [new TextRun({ text: `Rapport généré le ${new Date().toLocaleDateString("fr-FR")} à ${new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" })} via Planning Ménage.`, italics: true, size: 16, color: "9C9284" })],
+    spacing: { before: 400 },
+  }));
+
+  const doc = new Document({
+    sections: [{ properties: {}, children }],
+    styles: { default: { document: { run: { font: "Calibri" } } } },
+  });
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `rapport-${(property?.name || "logement")}-${cleaning.date}.docx`.replace(/\s+/g, "-");
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
 // Synchronise TOUS les ménages assignés à cette personne (passés et à venir)
 // vers son Google Agenda personnel. Crée / met à jour / retire les
 // événements en fonction des changements depuis le dernier passage.
@@ -844,6 +999,7 @@ function PlanningTab({ profile, team, properties, cleanings, saveCleanings, save
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
   const [view, setView] = useState("liste");
+  const [sortDesc, setSortDesc] = useState(false);
 
   const visible = useMemo(() => {
     let list = cleanings;
@@ -852,8 +1008,8 @@ function PlanningTab({ profile, team, properties, cleanings, saveCleanings, save
     if (filter === "today") list = list.filter((c) => c.date === today && c.status !== "termine");
     else if (filter === "upcoming") list = list.filter((c) => c.date >= today && c.status !== "termine");
     else if (filter === "history") list = list.filter((c) => c.date < today || c.status === "termine");
-    return [...list].sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
-  }, [cleanings, profile, filter]);
+    return [...list].sort((a, b) => sortDesc ? (b.date + b.time).localeCompare(a.date + a.time) : (a.date + a.time).localeCompare(b.date + b.time));
+  }, [cleanings, profile, filter, sortDesc]);
 
   const todayPending = cleanings.filter((c) => c.date === todayISO() && c.status !== "termine" && (profile.role === "owner" || c.assignedToId === profile.id));
   const propertyOf = (id) => properties.find((p) => p.id === id);
@@ -897,6 +1053,13 @@ function PlanningTab({ profile, team, properties, cleanings, saveCleanings, save
       )}
       {view === "liste" && (
         <>
+          <div className="flex items-center justify-between mb-3">
+            <p style={{ color: C.taupe }} className="text-xs">{visible.length} mission{visible.length !== 1 ? "s" : ""}</p>
+            <button onClick={() => setSortDesc((v) => !v)} className="flex items-center gap-1.5 text-xs font-medium px-3 py-1.5 rounded-full" style={{ background: C.linenSoft, color: C.ink }}>
+              <Icon name={sortDesc ? "chevronDown" : "chevronUp"} size={13} color={C.taupe} />
+              {sortDesc ? "Plus récent d'abord" : "Plus ancien d'abord"}
+            </button>
+          </div>
           {visible.length === 0 && (
             <EmptyState icon="calendar" text={profile.role === "owner" ? "Aucun ménage ici. Ajoute-en un avec le bouton +." : "Aucun ménage ne t'est assigné pour l'instant."} />
           )}
@@ -1134,6 +1297,9 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const [dirtyQty, setDirtyQty] = useState(1);
   const [notes, setNotes] = useState(cleaning.notes || "");
   const [editing, setEditing] = useState(false);
+  const [generatingReport, setGeneratingReport] = useState(false);
+  const [sharing, setSharing] = useState(false);
+  const [shareMsg, setShareMsg] = useState("");
 
   useEffect(() => {
     (async () => {
@@ -1261,12 +1427,41 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
               <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
             </label>
           </div>
-          <p style={{ color: C.taupe }} className="text-xs mb-5">Les photos sont visibles par toute l'équipe.</p>
+          <p style={{ color: C.taupe }} className="text-xs mb-2">Les photos sont visibles par toute l'équipe.</p>
+          {photos.length > 0 && (
+            <>
+              <button
+                onClick={async () => {
+                  setSharing(true); setShareMsg("");
+                  const res = await shareCleaningPhotos(photos, property);
+                  if (res.ok) setShareMsg("");
+                  else if (res.reason === "not-supported") setShareMsg("Le partage direct n'est pas disponible sur ce navigateur. Appuie longuement sur une photo pour l'enregistrer, puis partage-la manuellement.");
+                  else if (res.reason === "error") setShareMsg("Le partage a échoué. Réessaie.");
+                  setSharing(false);
+                }}
+                disabled={sharing}
+                className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: C.linenSoft, color: C.ink }}>
+                {sharing ? <div className="animate-spin"><Icon name="loader" size={15} color={C.taupe} /></div> : <Icon name="share" size={15} color={C.taupe} />}
+                Partager les photos (WhatsApp, etc.)
+              </button>
+              {shareMsg && <p style={{ color: C.terracotta }} className="text-xs mb-3">{shareMsg}</p>}
+            </>
+          )}
         </>
       )}
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Notes</p>
       <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. clé sous le pot, interphone en panne…" rows={3}
         className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
+
+      <button
+        onClick={async () => { setGeneratingReport(true); try { await generateCleaningReport(cleaning, property, person, photos); } catch (e) {} setGeneratingReport(false); }}
+        disabled={generatingReport}
+        className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm mb-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+        {generatingReport ? <div className="animate-spin"><Icon name="loader" size={15} /></div> : <Icon name="download" size={15} />}
+        Générer le rapport de passage (Word)
+      </button>
+      <p style={{ color: C.taupe }} className="text-xs mb-5">Inclut les informations d'entreprise de {person?.name || "la personne assignée"}, le logement, la checklist et les photos prises.</p>
+
       {profile.role === "owner" && (
         <div className="flex flex-col gap-2">
           <button onClick={() => setEditing(true)} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: C.linenSoft, color: C.ink }}>
@@ -2338,27 +2533,28 @@ function EquipeTab({ team, profile, saveTeam, cleanings, saveCleanings, onSelfDe
       {team.length === 0 && <EmptyState icon="users" text="Personne n'a encore rejoint le planning." />}
       <div className="flex flex-col gap-2">
         {team.map((t) => {
-          const Wrapper = isOwner ? "button" : "div";
+          const canOpen = isOwner || t.id === profile.id;
+          const Wrapper = canOpen ? "button" : "div";
           const gcalColor = GCAL_COLORS.find((c) => c.id === t.color);
           return (
-            <Wrapper key={t.id} onClick={isOwner ? () => setOpenId(t.id) : undefined}
+            <Wrapper key={t.id} onClick={canOpen ? () => setOpenId(t.id) : undefined}
               className="w-full text-left flex items-center gap-3 px-4 py-3 rounded-2xl" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
               <div className="flex items-center justify-center rounded-full shrink-0" style={{ width: 36, height: 36, background: gcalColor ? gcalColor.hex : (t.role === "owner" ? C.terracotta : C.sauge), color: "#fff", fontFamily: "'Space Grotesk', sans-serif", fontWeight: 600 }}>
                 {t.name.charAt(0).toUpperCase()}
               </div>
               <div className="flex-1">
                 <p style={{ color: C.ink }} className="text-sm font-medium">{t.name} {t.id === profile.id && <span style={{ color: C.taupe }}>(toi)</span>}</p>
-                <p style={{ color: C.taupe }} className="text-xs">{t.role === "owner" ? "Propriétaire" : "Équipe de ménage"}{gcalColor ? ` · ${gcalColor.name}` : ""}</p>
+                <p style={{ color: C.taupe }} className="text-xs">{t.role === "owner" ? "Propriétaire" : "Équipe de ménage"}{gcalColor ? ` · ${gcalColor.name}` : ""}{t.companyName ? ` · ${t.companyName}` : ""}</p>
               </div>
-              {isOwner && <Icon name="chevronRight" size={18} color={C.taupe} />}
+              {canOpen && <Icon name="chevronRight" size={18} color={C.taupe} />}
             </Wrapper>
           );
         })}
       </div>
-      <p style={{ color: C.taupe }} className="text-xs mt-5">Une personne rejoint automatiquement l'équipe en ouvrant l'appli et en choisissant son prénom et son rôle.</p>
+      <p style={{ color: C.taupe }} className="text-xs mt-5">Une personne rejoint automatiquement l'équipe en ouvrant l'appli et en choisissant son prénom et son rôle. Chacun peut renseigner ses propres informations d'entreprise en tapant sur son profil.</p>
 
       {openMember && (
-        <MemberDetail member={openMember} team={team} isSelf={openMember.id === profile.id} onClose={() => setOpenId(null)}
+        <MemberDetail member={openMember} team={team} isSelf={openMember.id === profile.id} canEditFull={isOwner} onClose={() => setOpenId(null)}
           onUpdate={async (patch) => { await saveTeam(team.map((t) => (t.id === openMember.id ? { ...t, ...patch } : t))); setOpenId(null); }}
           onDelete={async () => {
             await saveTeam(team.filter((t) => t.id !== openMember.id));
@@ -2371,33 +2567,47 @@ function EquipeTab({ team, profile, saveTeam, cleanings, saveCleanings, onSelfDe
   );
 }
 
-function MemberDetail({ member, team, isSelf, onClose, onUpdate, onDelete }) {
+function MemberDetail({ member, team, isSelf, canEditFull, onClose, onUpdate, onDelete }) {
   const [name, setName] = useState(member.name);
   const [role, setRole] = useState(member.role);
   const [color, setColorState] = useState(member.color || null);
+  const [companyName, setCompanyName] = useState(member.companyName || "");
+  const [siret, setSiret] = useState(member.siret || "");
+  const [companyAddress, setCompanyAddress] = useState(member.companyAddress || "");
+  const [companyPhone, setCompanyPhone] = useState(member.companyPhone || "");
+  const [companyEmail, setCompanyEmail] = useState(member.companyEmail || "");
   const takenColorIds = team.filter((t) => t.id !== member.id && t.color).map((t) => t.color);
   const pickColor = (colorId) => {
     if (takenColorIds.includes(colorId)) return;
     setColorState(color === colorId ? null : colorId);
   };
+  const save = () => onUpdate({
+    name: name.trim(), role, color,
+    companyName: companyName.trim(), siret: siret.trim(), companyAddress: companyAddress.trim(),
+    companyPhone: companyPhone.trim(), companyEmail: companyEmail.trim(),
+  });
   return (
     <Sheet onClose={onClose} title="Modifier le profil">
       <Field label="Prénom">
         <input value={name} onChange={(e) => setName(e.target.value)} style={selectStyle} />
       </Field>
-      <div className="h-3" />
-      <Field label="Rôle">
-        <div className="grid grid-cols-2 gap-3 mt-1.5">
-          <button onClick={() => setRole("owner")} className="rounded-xl py-2.5 text-sm font-medium border transition"
-            style={{ background: role === "owner" ? C.terracotta : "transparent", color: role === "owner" ? "#fff" : C.taupe, borderColor: C.terracotta }}>
-            Propriétaire
-          </button>
-          <button onClick={() => setRole("cleaner")} className="rounded-xl py-2.5 text-sm font-medium border transition"
-            style={{ background: role === "cleaner" ? C.sauge : "transparent", color: role === "cleaner" ? "#fff" : C.taupe, borderColor: C.sauge }}>
-            Équipe de ménage
-          </button>
-        </div>
-      </Field>
+      {canEditFull && (
+        <>
+          <div className="h-3" />
+          <Field label="Rôle">
+            <div className="grid grid-cols-2 gap-3 mt-1.5">
+              <button onClick={() => setRole("owner")} className="rounded-xl py-2.5 text-sm font-medium border transition"
+                style={{ background: role === "owner" ? C.terracotta : "transparent", color: role === "owner" ? "#fff" : C.taupe, borderColor: C.terracotta }}>
+                Propriétaire
+              </button>
+              <button onClick={() => setRole("cleaner")} className="rounded-xl py-2.5 text-sm font-medium border transition"
+                style={{ background: role === "cleaner" ? C.sauge : "transparent", color: role === "cleaner" ? "#fff" : C.taupe, borderColor: C.sauge }}>
+                Équipe de ménage
+              </button>
+            </div>
+          </Field>
+        </>
+      )}
       <div className="h-3" />
       <Field label="Couleur (planning Ménage & Google Agenda)">
         <div className="grid grid-cols-6 gap-2 mb-1 mt-1.5">
@@ -2415,14 +2625,42 @@ function MemberDetail({ member, team, isSelf, onClose, onUpdate, onDelete }) {
         </div>
         <p style={{ color: C.taupe }} className="text-xs">Chaque couleur ne peut être prise que par une seule personne. Les couleurs grisées sont déjà utilisées.</p>
       </Field>
-      <button disabled={!name.trim()} onClick={() => onUpdate({ name: name.trim(), role, color })} className="w-full py-3 rounded-xl font-medium mt-5 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+
+      <div className="h-4" />
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-1">Informations d'entreprise</p>
+      <p style={{ color: C.taupe }} className="text-xs mb-3">Utilisées comme en-tête sur les rapports de passage (Word) générés pour tes ménages — utile pour la preuve d'intervention.</p>
+      <div className="flex flex-col gap-3">
+        <Field label="Nom de l'entreprise / auto-entrepreneur">
+          <input value={companyName} onChange={(e) => setCompanyName(e.target.value)} placeholder="Ex. Camille Nettoyage" style={selectStyle} />
+        </Field>
+        <Field label="SIRET">
+          <input value={siret} onChange={(e) => setSiret(e.target.value)} placeholder="Ex. 123 456 789 00012" style={selectStyle} />
+        </Field>
+        <Field label="Adresse">
+          <input value={companyAddress} onChange={(e) => setCompanyAddress(e.target.value)} placeholder="Adresse professionnelle" style={selectStyle} />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Téléphone">
+            <input type="tel" value={companyPhone} onChange={(e) => setCompanyPhone(e.target.value)} style={selectStyle} />
+          </Field>
+          <Field label="Email">
+            <input type="email" value={companyEmail} onChange={(e) => setCompanyEmail(e.target.value)} style={selectStyle} />
+          </Field>
+        </div>
+      </div>
+
+      <button disabled={!name.trim()} onClick={save} className="w-full py-3 rounded-xl font-medium mt-5 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
         Enregistrer
       </button>
       {isSelf && <p style={{ color: C.taupe }} className="text-xs mt-3">C'est ton propre profil.</p>}
-      <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm mt-3" style={{ background: "#F3DCCF", color: C.terracotta }}>
-        <Icon name="trash" size={15} /> Supprimer ce profil
-      </button>
-      <p style={{ color: C.taupe }} className="text-xs mt-2">Les ménages déjà assignés à cette personne repasseront en "non assigné".</p>
+      {canEditFull && (
+        <>
+          <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm mt-3" style={{ background: "#F3DCCF", color: C.terracotta }}>
+            <Icon name="trash" size={15} /> Supprimer ce profil
+          </button>
+          <p style={{ color: C.taupe }} className="text-xs mt-2">Les ménages déjà assignés à cette personne repasseront en "non assigné".</p>
+        </>
+      )}
     </Sheet>
   );
 }
