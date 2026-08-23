@@ -17,7 +17,7 @@
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://unpkg.com/[email protected]/dist/xlsx.full.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/[email protected]/build/index.umd.min.js"></script>
+<script src="https://unpkg.com/[email protected]/build/index.umd.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -392,6 +392,26 @@ function compressImage(file, maxW = 700, quality = 0.55) {
   });
 }
 
+// Charge la bibliothèque docx.js depuis un second serveur si elle n'a pas pu
+// se charger depuis le premier (ex. serveur bloqué sur le réseau de la
+// personne). Évite un échec pur et simple de la génération de rapport.
+function ensureDocxLoaded() {
+  return new Promise((resolve, reject) => {
+    if (window.docx) { resolve(); return; }
+    if (document.querySelector("script[data-docx-fallback]")) {
+      const check = setInterval(() => { if (window.docx) { clearInterval(check); resolve(); } }, 200);
+      setTimeout(() => { clearInterval(check); if (!window.docx) reject(new Error("La bibliothèque Word n'a pas pu se charger, même en secours. Vérifie ta connexion internet ou désactive temporairement un bloqueur de publicités/scripts pour ce site.")); }, 8000);
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = "https://cdn.jsdelivr.net/npm/[email protected]/build/index.umd.min.js";
+    script.setAttribute("data-docx-fallback", "1");
+    script.onload = () => { if (window.docx) resolve(); else reject(new Error("La bibliothèque Word s'est chargée mais n'a pas pu s'initialiser.")); };
+    script.onerror = () => reject(new Error("La bibliothèque Word n'a pas pu se charger, même en secours. Vérifie ta connexion internet ou désactive temporairement un bloqueur de publicités/scripts pour ce site."));
+    document.head.appendChild(script);
+  });
+}
+
 // Partage les photos d'un ménage via le menu de partage natif du téléphone
 // (WhatsApp, Messages, email...). Repose sur la Web Share API — disponible
 // sur la plupart des navigateurs mobiles, pas forcément sur ordinateur.
@@ -593,6 +613,8 @@ async function generateCleaningReport(cleaning, property, person, photos) {
     rows: [
       reportInfoRow("Logement", property?.name),
       reportInfoRow("Adresse", property?.address),
+      ...(property?.ownerName ? [reportInfoRow("Propriétaire", property.ownerName)] : []),
+      ...(property?.conciergerieName ? [reportInfoRow("Conciergerie", property.conciergerieName)] : []),
       reportInfoRow("Type de mission", isArrival ? "Arrivée client (remise de clés)" : "Ménage"),
       reportInfoRow("Date", fmtDate(cleaning.date)),
       reportInfoRow("Heure", cleaning.time),
@@ -655,6 +677,95 @@ async function generateCleaningReport(cleaning, property, person, photos) {
   const a = document.createElement("a");
   a.href = url;
   a.download = `rapport-${(property?.name || "logement")}-${cleaning.date}.docx`.replace(/\s+/g, "-");
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// Journal de bord mensuel — un tableau des interventions (ménages et
+// arrivées client) par logement, pour le mois consulté dans l'onglet
+// Réservations. Une section par logement, avec un saut de page entre
+// chacune, dans un seul fichier Word téléchargeable.
+async function generateMonthlyJournal({ monthLabel, properties, cleanings, team, monthStartISO, nextMonthStartISO }) {
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType } = docx;
+  const personOf = (id) => team.find((t) => t.id === id);
+  const children = [];
+
+  children.push(new Paragraph({
+    children: [new TextRun({ text: "Journal de bord des prestations", bold: true, size: 40, color: "20261F" })],
+    spacing: { after: 80 },
+  }));
+  children.push(new Paragraph({
+    children: [new TextRun({ text: monthLabel.charAt(0).toUpperCase() + monthLabel.slice(1), size: 24, color: "7C6B9C", bold: true })],
+    spacing: { after: 300 },
+  }));
+
+  const propertiesWithMissions = properties.filter((p) =>
+    cleanings.some((c) => c.propertyId === p.id && c.date >= monthStartISO && c.date < nextMonthStartISO)
+  );
+
+  if (propertiesWithMissions.length === 0) {
+    children.push(new Paragraph({ children: [new TextRun({ text: "Aucune mission enregistrée ce mois-ci.", italics: true, size: 20 })] }));
+  }
+
+  propertiesWithMissions.forEach((property, idx) => {
+    const missions = cleanings
+      .filter((c) => c.propertyId === property.id && c.date >= monthStartISO && c.date < nextMonthStartISO)
+      .sort((a, b) => (a.date + a.time).localeCompare(b.date + b.time));
+
+    children.push(new Paragraph({
+      children: [new TextRun({ text: property.name, bold: true, size: 28, color: "20261F" })],
+      heading: HeadingLevel.HEADING_2,
+      pageBreakBefore: idx > 0,
+      spacing: { before: idx > 0 ? 0 : 200, after: 120 },
+    }));
+
+    const introRows = [];
+    if (property.ownerName) introRows.push(reportInfoRow("Propriétaire", property.ownerName));
+    if (property.conciergerieName) introRows.push(reportInfoRow("Conciergerie", property.conciergerieName));
+    introRows.push(reportInfoRow("Adresse", property.address || "—"));
+    introRows.push(reportInfoRow("Période couverte", monthLabel));
+    children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows: introRows }));
+
+    children.push(new Paragraph({ text: "Registre des interventions", heading: HeadingLevel.HEADING_3, spacing: { before: 240, after: 100 } }));
+
+    const headerCell = (text) => new TableCell({
+      shading: { fill: "20261F" },
+      children: [new Paragraph({ children: [new TextRun({ text, bold: true, size: 18, color: "FFFFFF" })] })],
+    });
+    const bodyCell = (text) => new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String(text || "—"), size: 18 })] })] });
+
+    const rows = [new TableRow({ children: [headerCell("Date"), headerCell("Heure"), headerCell("Intervenant"), headerCell("Prestation"), headerCell("Statut")] })];
+    missions.forEach((c) => {
+      const person = personOf(c.assignedToId);
+      rows.push(new TableRow({
+        children: [
+          bodyCell(fmtDate(c.date)),
+          bodyCell(c.time),
+          bodyCell(person?.name || "Non assigné"),
+          bodyCell(c.type === "arrivee" ? "Arrivée client (remise de clés)" : "Ménage"),
+          bodyCell(STATUS[c.status]?.label || c.status),
+        ],
+      }));
+    });
+    children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows }));
+  });
+
+  children.push(new Paragraph({
+    children: [new TextRun({ text: `Journal généré le ${new Date().toLocaleDateString("fr-FR")} via Planning Ménage.`, italics: true, size: 16, color: "9C9284" })],
+    spacing: { before: 400 },
+  }));
+
+  const doc = new Document({
+    sections: [{ properties: {}, children }],
+    styles: { default: { document: { run: { font: "Calibri" } } } },
+  });
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `journal-de-bord-${monthLabel}.docx`.replace(/\s+/g, "-");
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -807,7 +918,7 @@ function App() {
               <PlanningTab profile={profile} team={team} properties={properties} cleanings={cleanings} saveCleanings={saveCleanings} saveProperties={saveProperties} />
             )}
             {tab === "occupation" && (
-              <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} cleanings={cleanings} saveCleanings={saveCleanings} />
+              <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} cleanings={cleanings} saveCleanings={saveCleanings} team={team} />
             )}
             {tab === "stats" && profile.role === "owner" && (
               <StatsTab properties={properties} cleanings={cleanings} reservations={reservations} team={team} profile={profile} saveCleanings={saveCleanings} saveProperties={saveProperties} />
@@ -1458,7 +1569,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
         onClick={async () => {
           setGeneratingReport(true); setReportMsg("");
           try {
-            if (!window.docx) throw new Error("La bibliothèque de génération Word ne s'est pas chargée (connexion internet ou bloqueur de script). Réessaie dans quelques secondes ou vérifie ta connexion.");
+            if (!window.docx) await ensureDocxLoaded();
             await generateCleaningReport(cleaning, property, person, photos);
           } catch (e) {
             console.error("Erreur génération rapport :", e);
@@ -1538,12 +1649,14 @@ function useHorizontalScroll() {
   return ref;
 }
 
-function OccupationTab({ profile, properties, reservations, saveReservations, cleanings, saveCleanings }) {
+function OccupationTab({ profile, properties, reservations, saveReservations, cleanings, saveCleanings, team }) {
   const [monthOffset, setMonthOffset] = useState(0);
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
   const [generating, setGenerating] = useState(false);
   const [genMsg, setGenMsg] = useState("");
+  const [generatingJournal, setGeneratingJournal] = useState(false);
+  const [journalMsg, setJournalMsg] = useState("");
   const isDesktop = useIsDesktop();
   const dayW = isDesktop ? 42 : DAY_W;
   const labelW = isDesktop ? 150 : LABEL_W;
@@ -1557,7 +1670,6 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
     setGenerating(false);
     setGenMsg(added > 0 ? `${added} mission${added > 1 ? "s" : ""} créée${added > 1 ? "s" : ""}.` : "Tout est déjà à jour.");
   };
-
   const now = new Date();
   const base = new Date(now.getFullYear(), now.getMonth() + monthOffset, 1);
   const year = base.getFullYear(), month = base.getMonth();
@@ -1617,6 +1729,29 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
             Générer les ménages manquants
           </button>
           {genMsg && <p style={{ color: C.sauge }} className="text-xs mt-1.5">{genMsg}</p>}
+        </div>
+      )}
+
+      {profile.role === "owner" && properties.length > 0 && (
+        <div className="mb-4">
+          <button
+            onClick={async () => {
+              setGeneratingJournal(true); setJournalMsg("");
+              try {
+                if (!window.docx) await ensureDocxLoaded();
+                await generateMonthlyJournal({ monthLabel, properties, cleanings, team, monthStartISO, nextMonthStartISO });
+              } catch (e) {
+                console.error("Erreur génération journal :", e);
+                setJournalMsg(e?.message || "La génération du journal a échoué. Réessaie.");
+              }
+              setGeneratingJournal(false);
+            }}
+            disabled={generatingJournal}
+            className="text-xs font-medium px-3 py-2 rounded-xl flex items-center gap-2 disabled:opacity-60" style={{ background: C.linenSoft, color: C.ink }}>
+            {generatingJournal ? <div className="animate-spin"><Icon name="loader" size={14} color={C.taupe} /></div> : <Icon name="download" size={14} color={C.taupe} />}
+            Journal de bord du mois (Word)
+          </button>
+          {journalMsg && <p style={{ color: C.terracotta }} className="text-xs mt-1.5">{journalMsg}</p>}
         </div>
       )}
 
@@ -1982,6 +2117,8 @@ function PropertyForm({ onClose, onCreate }) {
 function PropertyDetail({ property, profile, cleanings, saveCleanings, reservations, saveReservations, onClose, onUpdate, onDelete }) {
   const [newItem, setNewItem] = useState("");
   const [notes, setNotes] = useState(property.notes || "");
+  const [ownerName, setOwnerName] = useState(property.ownerName || "");
+  const [conciergerieName, setConciergerieName] = useState(property.conciergerieName || "");
   const [kitPrice, setKitPrice] = useState(property.kitPrice != null ? String(property.kitPrice) : "15");
   const [defaultCleaningPrice, setDefaultCleaningPrice] = useState(property.defaultCleaningPrice != null ? String(property.defaultCleaningPrice) : "");
   const [cleaningDuration, setCleaningDuration] = useState(property.cleaningDuration != null ? String(property.cleaningDuration) : "120");
@@ -1995,6 +2132,8 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const addItem = () => { if (!newItem.trim()) return; onUpdate({ checklist: [...property.checklist, { id: uid(), text: newItem.trim() }] }); setNewItem(""); };
   const removeItem = (id) => onUpdate({ checklist: property.checklist.filter((i) => i.id !== id) });
   const saveNotes = () => onUpdate({ notes });
+  const saveOwnerName = () => onUpdate({ ownerName: ownerName.trim() });
+  const saveConciergerieName = () => onUpdate({ conciergerieName: conciergerieName.trim() });
   const saveKitPrice = () => onUpdate({ kitPrice: Number(kitPrice) || 0 });
   const saveDefaultCleaningPrice = () => onUpdate({ defaultCleaningPrice: defaultCleaningPrice.trim() === "" ? null : Number(defaultCleaningPrice) });
   const saveCleaningDuration = () => onUpdate({ cleaningDuration: Math.max(15, Number(cleaningDuration) || 120) });
@@ -2052,6 +2191,17 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   return (
     <Sheet onClose={onClose} title={property.name}>
       {property.address && <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-5"><Icon name="mapPin" size={14} /> {property.address}</p>}
+
+      {isOwner && (
+        <div className="grid grid-cols-2 gap-3 mb-5">
+          <Field label="Nom du propriétaire">
+            <input value={ownerName} onChange={(e) => setOwnerName(e.target.value)} onBlur={saveOwnerName} placeholder="Ex. Julien Thomas" style={selectStyle} />
+          </Field>
+          <Field label="Conciergerie">
+            <input value={conciergerieName} onChange={(e) => setConciergerieName(e.target.value)} onBlur={saveConciergerieName} placeholder="Ex. We Rent Atlantic" style={selectStyle} />
+          </Field>
+        </div>
+      )}
 
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Info importante</p>
       {isOwner ? (
