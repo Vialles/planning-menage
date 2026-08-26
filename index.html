@@ -18,6 +18,8 @@
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 <script src="https://unpkg.com/[email protected]/dist/xlsx.full.min.js"></script>
 <script src="https://unpkg.com/[email protected]/build/index.umd.min.js"></script>
+<script src="https://unpkg.com/[email protected]/dist/jszip.min.js"></script>
+<script src="https://unpkg.com/[email protected]/dist/html2canvas.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -772,6 +774,151 @@ async function generateMonthlyJournal({ monthLabel, properties, cleanings, team,
   setTimeout(() => URL.revokeObjectURL(url), 5000);
 }
 
+/* ---------------------------------------------------------
+   SAUVEGARDE COMPLÈTE (.zip) ET RESTAURATION
+   Contient : un instantané JSON complet de toutes les données (logements,
+   ménages, réservations, équipe, photos) pour restauration sans perte, un
+   Excel détaillé sur la période choisie (mois ou année), et une image du
+   planning Gantt Ménage du mois en cours.
+--------------------------------------------------------- */
+async function buildFullBackupData(properties, cleanings, reservations, team) {
+  const photos = {};
+  for (const c of cleanings) {
+    try {
+      const raw = await cloudGet(`photos:${c.id}`);
+      if (raw) { const arr = JSON.parse(raw); if (arr.length) photos[c.id] = arr; }
+    } catch (e) {}
+  }
+  return { app: "planning-menage", version: 1, exportedAt: new Date().toISOString(), properties, cleanings, reservations, team, photos };
+}
+
+function buildBackupWorkbook({ properties, cleanings, reservations, team, startISO, endISO, periodLabel }) {
+  const wb = XLSX.utils.book_new();
+  const personOf = (id) => team.find((t) => t.id === id);
+  const propertyOf = (id) => properties.find((p) => p.id === id);
+  const inRange = (d) => d >= startISO && d < endISO;
+
+  const resInRange = reservations.filter((r) => r.checkOut > startISO && r.checkIn < endISO);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    resInRange.map((r) => ({
+      Logement: propertyOf(r.propertyId)?.name || "", Client: r.guestName, Téléphone: r.guestPhone || "",
+      Arrivée: r.checkIn, Départ: r.checkOut, Source: SOURCES[r.source]?.label || r.source,
+      "Prix ménage (€)": r.cleaningPrice != null ? r.cleaningPrice : (propertyOf(r.propertyId)?.defaultCleaningPrice ?? ""),
+    }))
+  ), "Réservations");
+
+  const missionsInRange = cleanings.filter((c) => inRange(c.date));
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
+    missionsInRange.map((c) => ({
+      Logement: propertyOf(c.propertyId)?.name || "", Type: c.type === "arrivee" ? "Arrivée client" : "Ménage",
+      Date: c.date, Heure: c.time, Statut: STATUS[c.status]?.label || c.status,
+      "Assigné à": personOf(c.assignedToId)?.name || "Non assigné", Notes: c.notes || "",
+    }))
+  ), "Missions");
+
+  const menageDone = missionsInRange.filter((c) => (c.type || "menage") === "menage" && c.status === "termine");
+  const timeByPerson = team.map((t) => {
+    const list = menageDone.filter((c) => c.assignedToId === t.id);
+    const minutes = list.reduce((s, c) => s + (propertyOf(c.propertyId)?.cleaningDuration || 120), 0);
+    return { Personne: t.name, "Ménages terminés": list.length, "Temps total": formatDuration(minutes) };
+  }).filter((x) => x["Ménages terminés"] > 0);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(timeByPerson), "Temps par personne");
+
+  const timeByProperty = properties.map((p) => {
+    const list = menageDone.filter((c) => c.propertyId === p.id);
+    return { Logement: p.name, "Ménages terminés": list.length, "Temps total": formatDuration(list.length * (p.cleaningDuration || 120)) };
+  }).filter((x) => x["Ménages terminés"] > 0);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(timeByProperty), "Temps par logement");
+
+  const arriveeDone = missionsInRange.filter((c) => c.type === "arrivee" && c.status === "termine");
+  const arriveeByProperty = properties.filter((p) => p.keyHandoverEnabled).map((p) => {
+    const list = arriveeDone.filter((c) => c.propertyId === p.id);
+    return { Logement: p.name, "Arrivées terminées": list.length, "Montant (€)": list.length * (p.keyHandoverPrice || 0) };
+  }).filter((x) => x["Arrivées terminées"] > 0);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(arriveeByProperty), "Arrivées par logement");
+
+  const laundryRows = [];
+  properties.forEach((p) => {
+    (p.laundryLog || []).filter((e) => inRange(e.date)).forEach((e) => laundryRows.push({ Logement: p.name, Date: e.date, "Kits envoyés": e.count, "Prix par kit (€)": p.kitPrice || 0, "Total (€)": (e.count || 0) * (p.kitPrice || 0) }));
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(laundryRows), "Blanchisserie");
+
+  const selfWashRows = [];
+  properties.forEach((p) => {
+    (p.selfWashLog || []).filter((e) => inRange(e.date)).forEach((e) => selfWashRows.push({ Logement: p.name, Date: e.date, "Kits lavés": e.count }));
+  });
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(selfWashRows), "Lavé par nous-même");
+
+  return wb;
+}
+
+async function downloadFullBackup({ properties, cleanings, reservations, team, scope, monthLabel, monthStartISO, nextMonthStartISO, yearLabel, yearStartISO, yearEndISO, ganttEl }) {
+  const zip = new JSZip();
+
+  const backupData = await buildFullBackupData(properties, cleanings, reservations, team);
+  zip.file("sauvegarde-complete.json", JSON.stringify(backupData, null, 2));
+
+  const isYear = scope === "year";
+  const periodLabel = isYear ? yearLabel : monthLabel;
+  const wb = buildBackupWorkbook({
+    properties, cleanings, reservations, team,
+    startISO: isYear ? yearStartISO : monthStartISO, endISO: isYear ? yearEndISO : nextMonthStartISO, periodLabel,
+  });
+  const xlsxBytes = XLSX.write(wb, { bookType: "xlsx", type: "array" });
+  zip.file(`statistiques-${periodLabel}.xlsx`.replace(/\s+/g, "-"), xlsxBytes);
+
+  if (ganttEl && window.html2canvas) {
+    try {
+      const canvas = await html2canvas(ganttEl, { backgroundColor: "#F6F2E9", scale: 2 });
+      const imgBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (imgBlob) zip.file(`planning-menage-${todayISO()}.png`, imgBlob);
+    } catch (e) {}
+  }
+
+  const zipBlob = await zip.generateAsync({ type: "blob" });
+  const url = URL.createObjectURL(zipBlob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `sauvegarde-planning-menage-${todayISO()}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// Lit un fichier de sauvegarde (.zip ou .json) et renvoie les données parsées
+// SANS rien écrire — la restauration effective se fait après confirmation.
+async function parseBackupFile(file) {
+  let jsonText;
+  if (file.name.toLowerCase().endsWith(".zip")) {
+    const zip = await JSZip.loadAsync(file);
+    let entry = zip.file("sauvegarde-complete.json");
+    if (!entry) {
+      const jsonEntries = Object.values(zip.files).filter((f) => f.name.toLowerCase().endsWith(".json"));
+      entry = jsonEntries[0];
+    }
+    if (!entry) throw new Error("Aucun fichier de sauvegarde (.json) trouvé dans ce zip.");
+    jsonText = await entry.async("string");
+  } else {
+    jsonText = await file.text();
+  }
+  const data = JSON.parse(jsonText);
+  if (!Array.isArray(data.properties) || !Array.isArray(data.cleanings)) {
+    throw new Error("Ce fichier ne ressemble pas à une sauvegarde valide de Planning Ménage.");
+  }
+  return data;
+}
+async function restoreFromBackupData(data, { saveProperties, saveCleanings, saveReservations, saveTeam }) {
+  await saveProperties(data.properties || []);
+  await saveCleanings(data.cleanings || []);
+  await saveReservations(data.reservations || []);
+  await saveTeam(data.team || []);
+  const photos = data.photos || {};
+  for (const cleaningId of Object.keys(photos)) {
+    try { await cloudSet(`photos:${cleaningId}`, JSON.stringify(photos[cleaningId])); } catch (e) {}
+  }
+}
+
 // Synchronise TOUS les ménages assignés à cette personne (passés et à venir)
 // vers son Google Agenda personnel. Crée / met à jour / retire les
 // événements en fonction des changements depuis le dernier passage.
@@ -921,7 +1068,7 @@ function App() {
               <OccupationTab profile={profile} properties={properties} reservations={reservations} saveReservations={saveReservations} cleanings={cleanings} saveCleanings={saveCleanings} team={team} />
             )}
             {tab === "stats" && profile.role === "owner" && (
-              <StatsTab properties={properties} cleanings={cleanings} reservations={reservations} team={team} profile={profile} saveCleanings={saveCleanings} saveProperties={saveProperties} />
+              <StatsTab properties={properties} cleanings={cleanings} reservations={reservations} team={team} profile={profile} saveCleanings={saveCleanings} saveProperties={saveProperties} saveReservations={saveReservations} saveTeam={saveTeam} />
             )}
             {tab === "proprietes" && (
               <ProprietesTab profile={profile} properties={properties} saveProperties={saveProperties} cleanings={cleanings} saveCleanings={saveCleanings} reservations={reservations} saveReservations={saveReservations} />
@@ -2387,6 +2534,147 @@ function StatRow({ left, right, color, last }) {
   );
 }
 
+/* =========================================================
+   SAUVEGARDE COMPLÈTE — export .zip (JSON + Excel + image du
+   planning) et restauration à partir d'un fichier précédemment
+   téléchargé. Le JSON contient TOUT (logements, ménages,
+   réservations, équipe, photos) : c'est lui qui sert à restaurer
+   sans rien perdre, indépendamment des mises à jour de l'appli.
+========================================================= */
+function BackupSection({ profile, properties, cleanings, reservations, team, saveProperties, saveCleanings, saveReservations, saveTeam }) {
+  const [scope, setScope] = useState("month");
+  const [backingUp, setBackingUp] = useState(false);
+  const [backupMsg, setBackupMsg] = useState("");
+  const [restoreFile, setRestoreFile] = useState(null);
+  const [restorePreview, setRestorePreview] = useState(null);
+  const [restoring, setRestoring] = useState(false);
+  const [restoreMsg, setRestoreMsg] = useState("");
+  const ganttRef = useRef(null);
+
+  if (profile.role !== "owner") return null;
+
+  const now = new Date();
+  const monthLabel = now.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+  const monthStartISO = isoOf(now.getFullYear(), now.getMonth(), 1);
+  const nextMonthStartISO = isoOf(now.getFullYear(), now.getMonth() + 1, 1);
+  const yearLabel = String(now.getFullYear());
+  const yearStartISO = `${now.getFullYear()}-01-01`;
+  const yearEndISO = `${now.getFullYear() + 1}-01-01`;
+
+  const runBackup = async () => {
+    setBackingUp(true); setBackupMsg("");
+    try {
+      await downloadFullBackup({
+        properties, cleanings, reservations, team, scope,
+        monthLabel, monthStartISO, nextMonthStartISO, yearLabel, yearStartISO, yearEndISO,
+        ganttEl: ganttRef.current,
+      });
+    } catch (e) {
+      console.error("Erreur sauvegarde :", e);
+      setBackupMsg(e?.message || "La sauvegarde a échoué. Réessaie.");
+    }
+    setBackingUp(false);
+  };
+
+  const onPickRestoreFile = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setRestoreMsg(""); setRestorePreview(null); setRestoreFile(null);
+    try {
+      const data = await parseBackupFile(file);
+      setRestoreFile(file);
+      setRestorePreview({
+        exportedAt: data.exportedAt ? new Date(data.exportedAt).toLocaleString("fr-FR") : "date inconnue",
+        properties: data.properties.length, cleanings: data.cleanings.length,
+        reservations: (data.reservations || []).length, team: (data.team || []).length,
+        data,
+      });
+    } catch (err) {
+      setRestoreMsg(err?.message || "Impossible de lire ce fichier.");
+    }
+    e.target.value = "";
+  };
+
+  const confirmRestore = async () => {
+    if (!restorePreview) return;
+    setRestoring(true); setRestoreMsg("");
+    try {
+      await restoreFromBackupData(restorePreview.data, { saveProperties, saveCleanings, saveReservations, saveTeam });
+      setRestoreMsg("Restauration terminée ! Les données affichées vont se mettre à jour.");
+      setRestorePreview(null);
+    } catch (e) {
+      console.error("Erreur restauration :", e);
+      setRestoreMsg("La restauration a échoué. Réessaie.");
+    }
+    setRestoring(false);
+  };
+
+  return (
+    <div className="mb-6">
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Sauvegarde complète</p>
+      <div className="rounded-2xl p-3" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
+        <p style={{ color: C.taupe }} className="text-xs mb-3">
+          Télécharge un fichier .zip contenant toutes tes données (pour ne jamais les perdre), un Excel détaillé et une image du planning. À conserver de ton côté (Drive, ordinateur...).
+        </p>
+        <div className="flex gap-2 mb-3">
+          <button onClick={() => setScope("month")} className="flex-1 py-2 rounded-lg text-xs font-medium border"
+            style={{ background: scope === "month" ? C.ink : "transparent", color: scope === "month" ? "#fff" : C.taupe, borderColor: C.ink }}>
+            Excel du mois affiché
+          </button>
+          <button onClick={() => setScope("year")} className="flex-1 py-2 rounded-lg text-xs font-medium border"
+            style={{ background: scope === "year" ? C.ink : "transparent", color: scope === "year" ? "#fff" : C.taupe, borderColor: C.ink }}>
+            Excel de l'année {yearLabel}
+          </button>
+        </div>
+        <button onClick={runBackup} disabled={backingUp}
+          className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+          {backingUp ? <div className="animate-spin"><Icon name="loader" size={15} /></div> : <Icon name="download" size={15} />}
+          Télécharger la sauvegarde (.zip)
+        </button>
+        {backupMsg && <p style={{ color: C.terracotta }} className="text-xs mt-2">{backupMsg}</p>}
+        <p style={{ color: C.taupe }} className="text-xs mt-2">L'image du planning correspond toujours au mois en cours.</p>
+      </div>
+
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2 mt-5">Restaurer une sauvegarde</p>
+      <div className="rounded-2xl p-3" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
+        <p style={{ color: C.taupe }} className="text-xs mb-3">
+          Remplace TOUTES les données actuelles de l'appli par celles d'un fichier de sauvegarde (.zip ou .json) téléchargé précédemment. Utile si tu changes de version de l'appli ou en cas de problème — rien n'est perdu tant que tu as une sauvegarde.
+        </p>
+        <label className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 cursor-pointer" style={{ background: C.linenSoft, color: C.ink }}>
+          <Icon name="download" size={15} color={C.taupe} /> Choisir un fichier de sauvegarde
+          <input type="file" accept=".zip,.json" className="hidden" onChange={onPickRestoreFile} />
+        </label>
+        {restoreMsg && <p style={{ color: restorePreview ? C.sauge : C.terracotta }} className="text-xs mt-2">{restoreMsg}</p>}
+
+        {restorePreview && (
+          <div className="mt-3 rounded-xl p-3" style={{ background: "#F3DCCF" }}>
+            <p style={{ color: C.terracotta }} className="text-xs font-semibold mb-1.5">⚠ Cette action remplace toutes les données actuelles</p>
+            <p style={{ color: C.ink }} className="text-xs mb-1">Sauvegarde du {restorePreview.exportedAt}</p>
+            <p style={{ color: C.ink }} className="text-xs mb-3">
+              {restorePreview.properties} logement{restorePreview.properties !== 1 ? "s" : ""} · {restorePreview.cleanings} mission{restorePreview.cleanings !== 1 ? "s" : ""} · {restorePreview.reservations} réservation{restorePreview.reservations !== 1 ? "s" : ""} · {restorePreview.team} membre{restorePreview.team !== 1 ? "s" : ""} d'équipe
+            </p>
+            <div className="flex gap-2">
+              <button onClick={() => { setRestorePreview(null); setRestoreMsg(""); }} className="flex-1 py-2 rounded-lg text-xs font-medium" style={{ background: "#fff", color: C.taupe }}>
+                Annuler
+              </button>
+              <button onClick={confirmRestore} disabled={restoring} className="flex-1 py-2 rounded-lg text-xs font-medium disabled:opacity-50" style={{ background: C.terracotta, color: "#fff" }}>
+                {restoring ? "Restauration..." : "Confirmer et restaurer"}
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Capture cachée du planning Ménage du mois en cours, pour la sauvegarde */}
+      <div style={{ position: "fixed", left: -9999, top: 0, width: 900 }}>
+        <div ref={ganttRef}>
+          <MenageGanttChart profile={{ role: "owner", id: "backup" }} team={team} properties={properties} cleanings={cleanings} onOpen={() => {}} />
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Génère et télécharge un fichier Excel (.xlsx) reprenant toutes les
 // données affichées sur la page Statistiques pour le mois consulté.
 function exportStatsToExcel({ monthLabel, occupancy, byPerson, timeByPerson, timeByProperty, arriveeByPerson, arriveeByProperty, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf }) {
@@ -2439,7 +2727,7 @@ function exportStatsToExcel({ monthLabel, occupancy, byPerson, timeByPerson, tim
   XLSX.writeFile(wb, `statistiques-${safeMonth}.xlsx`);
 }
 
-function StatsTab({ properties, cleanings, reservations, team, profile, saveCleanings, saveProperties }) {
+function StatsTab({ properties, cleanings, reservations, team, profile, saveCleanings, saveProperties, saveReservations, saveTeam }) {
   const [monthOffset, setMonthOffset] = useState(0);
   const [openLateId, setOpenLateId] = useState(null);
 
@@ -2562,6 +2850,9 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
         <p style={{ color: C.ink, fontFamily: "'Space Grotesk', sans-serif" }} className="text-sm font-semibold capitalize">{monthLabel}</p>
         <button onClick={() => setMonthOffset((m) => m + 1)} className="rounded-full p-1.5" style={{ background: C.linenSoft }}><Icon name="chevronRight" size={16} color={C.taupe} /></button>
       </div>
+
+      <BackupSection profile={profile} properties={properties} cleanings={cleanings} reservations={reservations} team={team}
+        saveProperties={saveProperties} saveCleanings={saveCleanings} saveReservations={saveReservations} saveTeam={saveTeam} />
 
       {properties.length === 0 ? (
         <EmptyState icon="home" text="Ajoute un logement pour voir apparaître tes statistiques." />
