@@ -23,6 +23,7 @@
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-storage-compat.js"></script>
 <script src="https://accounts.google.com/gsi/client" async defer></script>
 <style>
   html, body, #root { height: 100%; margin: 0; }
@@ -321,6 +322,7 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     download: "M12 4v11 M7.5 11 12 15.5 16.5 11 M4 19h16",
     share: "M18 8a3 3 0 1 0-2.83-4 M6 12a3 3 0 1 0 0 0 M18 20a3 3 0 1 0-2.83-4 M8.6 10.5l6.8-3.8 M8.6 13.5l6.8 3.8",
     key: "M15 7a4 4 0 1 0-3.9 4H15l2 2 2-2 2 2 2-2-2-2h-4.1",
+    video: "M3 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z M15 10l6-3.5v11L15 14Z",
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
@@ -371,6 +373,24 @@ function cloudListen(key, cb) {
 }
 function localGet(key) { try { return localStorage.getItem(key); } catch (e) { return null; } }
 function localSet(key, value) { try { localStorage.setItem(key, value); } catch (e) {} }
+
+// Les vidéos sont bien trop volumineuses pour être stockées dans Firestore
+// (limite de 1 Mo par document) : elles sont envoyées dans Firebase Storage,
+// et seule leur URL de téléchargement + leur chemin sont gardés dans
+// Firestore (clé `videos:{cleaningId}`), sur le même principe que les photos.
+async function uploadVideoToStorage(file, cleaningId) {
+  await authReady;
+  const ext = (file.name.split(".").pop() || "mp4").toLowerCase();
+  const path = `videos/${cleaningId}/${uid()}.${ext}`;
+  const ref = firebase.storage().ref(path);
+  await ref.put(file);
+  const url = await ref.getDownloadURL();
+  return { url, path, name: file.name, size: file.size };
+}
+async function deleteVideoFromStorage(path) {
+  if (!path) return;
+  try { await firebase.storage().ref(path).delete(); } catch (e) {}
+}
 
 function compressImage(file, maxW = 700, quality = 0.55) {
   return new Promise((resolve, reject) => {
@@ -783,13 +803,18 @@ async function generateMonthlyJournal({ monthLabel, properties, cleanings, team,
 --------------------------------------------------------- */
 async function buildFullBackupData(properties, cleanings, reservations, team) {
   const photos = {};
+  const videos = {};
   for (const c of cleanings) {
     try {
       const raw = await cloudGet(`photos:${c.id}`);
       if (raw) { const arr = JSON.parse(raw); if (arr.length) photos[c.id] = arr; }
     } catch (e) {}
+    try {
+      const raw = await cloudGet(`videos:${c.id}`);
+      if (raw) { const arr = JSON.parse(raw); if (arr.length) videos[c.id] = arr; }
+    } catch (e) {}
   }
-  return { app: "planning-menage", version: 1, exportedAt: new Date().toISOString(), properties, cleanings, reservations, team, photos };
+  return { app: "planning-menage", version: 1, exportedAt: new Date().toISOString(), properties, cleanings, reservations, team, photos, videos };
 }
 
 function buildBackupWorkbook({ properties, cleanings, reservations, team, startISO, endISO, periodLabel }) {
@@ -917,6 +942,105 @@ async function restoreFromBackupData(data, { saveProperties, saveCleanings, save
   for (const cleaningId of Object.keys(photos)) {
     try { await cloudSet(`photos:${cleaningId}`, JSON.stringify(photos[cleaningId])); } catch (e) {}
   }
+  // Les vidéos elles-mêmes restent dans Firebase Storage (jamais supprimées
+  // par une restauration) — on ne restaure ici que les références vers elles.
+  const videos = data.videos || {};
+  for (const cleaningId of Object.keys(videos)) {
+    try { await cloudSet(`videos:${cleaningId}`, JSON.stringify(videos[cleaningId])); } catch (e) {}
+  }
+}
+
+/* ---------------------------------------------------------
+   EXPORT PHOTOS & VIDÉOS PAR MÉNAGE (.zip)
+   Un dossier par mission (logement + date + type), contenant ses photos et
+   vidéos en fichiers réels (pas en JSON), pour un archivage ou un envoi
+   facile par mail/WhatsApp.
+--------------------------------------------------------- */
+function sanitizeZipName(s) {
+  return (s || "sans-nom").replace(/[\\/:*?"<>|]/g, "-").replace(/\s+/g, " ").trim();
+}
+function dataURLtoBlob(dataUrl) {
+  const [header, base64] = dataUrl.split(",");
+  const mimeMatch = header.match(/data:(.*?);base64/);
+  const mime = mimeMatch ? mimeMatch[1] : "image/jpeg";
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+// Tente le partage natif (mail, WhatsApp, etc. selon ce qui est installé) ;
+// si le navigateur ne le permet pas pour ce fichier, ou si aucune app de
+// partage de fichiers n'est disponible, on retombe sur un téléchargement
+// classique.
+async function shareOrDownloadBlob(blob, filename, mimeType) {
+  try {
+    const file = new File([blob], filename, { type: mimeType });
+    if (navigator.canShare && navigator.canShare({ files: [file] })) {
+      await navigator.share({ files: [file], title: filename });
+      return { ok: true, method: "share" };
+    }
+  } catch (e) {
+    if (e?.name === "AbortError") return { ok: true, method: "share-cancelled" };
+  }
+  downloadBlob(blob, filename);
+  return { ok: true, method: "download" };
+}
+// Construit un zip avec un dossier par mission contenant ses photos et
+// vidéos. startISO/endISOExclusive filtrent par date (null = pas de filtre,
+// donc tout l'historique). Retourne null si aucun média n'est trouvé.
+async function buildMediaExportZip({ properties, cleanings, startISO, endISOExclusive, onProgress }) {
+  const zip = new JSZip();
+  const propertyOf = (id) => properties.find((p) => p.id === id);
+  const inRange = (d) => (!startISO || d >= startISO) && (!endISOExclusive || d < endISOExclusive);
+  const relevant = cleanings.filter((c) => inRange(c.date)).sort((a, b) => (a.date < b.date ? -1 : 1));
+  let foldersAdded = 0;
+  const usedNames = {};
+  for (let i = 0; i < relevant.length; i++) {
+    const c = relevant[i];
+    if (onProgress) onProgress(i + 1, relevant.length);
+    let photos = [];
+    let videos = [];
+    try { const raw = await cloudGet(`photos:${c.id}`); photos = raw ? JSON.parse(raw) : []; } catch (e) {}
+    try { const raw = await cloudGet(`videos:${c.id}`); videos = raw ? JSON.parse(raw) : []; } catch (e) {}
+    if (photos.length === 0 && videos.length === 0) continue;
+
+    const property = propertyOf(c.propertyId);
+    const typeLabel = c.type === "arrivee" ? "Arrivee" : "Menage";
+    let folderName = sanitizeZipName(`${property?.name || "Logement"} - ${c.date} - ${typeLabel}`);
+    if (usedNames[folderName] != null) {
+      usedNames[folderName]++;
+      folderName = `${folderName} (${usedNames[folderName]})`;
+    } else {
+      usedNames[folderName] = 0;
+    }
+    const folder = zip.folder(folderName);
+
+    photos.forEach((src, idx) => {
+      try { folder.file(`photo-${idx + 1}.jpg`, dataURLtoBlob(src)); } catch (e) {}
+    });
+    for (let vIdx = 0; vIdx < videos.length; vIdx++) {
+      const v = videos[vIdx];
+      try {
+        const resp = await fetch(v.url);
+        const blob = await resp.blob();
+        const ext = (v.name || "").split(".").pop()?.toLowerCase() || "mp4";
+        folder.file(`video-${vIdx + 1}.${ext}`, blob);
+      } catch (e) {}
+    }
+    foldersAdded++;
+  }
+  if (foldersAdded === 0) return null;
+  return await zip.generateAsync({ type: "blob" });
 }
 
 // Synchronise TOUS les ménages assignés à cette personne (passés et à venir)
@@ -1551,6 +1675,10 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const [photos, setPhotos] = useState([]);
   const [loadingPhotos, setLoadingPhotos] = useState(true);
   const [uploading, setUploading] = useState(false);
+  const [videos, setVideos] = useState([]);
+  const [loadingVideos, setLoadingVideos] = useState(true);
+  const [uploadingVideo, setUploadingVideo] = useState(false);
+  const [videoMsg, setVideoMsg] = useState("");
   const [addingKit, setAddingKit] = useState(false);
   const [dirtyQty, setDirtyQty] = useState(1);
   const [notes, setNotes] = useState(cleaning.notes || "");
@@ -1565,6 +1693,14 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
       const raw = await cloudGet(`photos:${cleaning.id}`);
       setPhotos(raw ? JSON.parse(raw) : []);
       setLoadingPhotos(false);
+    })();
+  }, [cleaning.id]);
+
+  useEffect(() => {
+    (async () => {
+      const raw = await cloudGet(`videos:${cleaning.id}`);
+      setVideos(raw ? JSON.parse(raw) : []);
+      setLoadingVideos(false);
     })();
   }, [cleaning.id]);
 
@@ -1599,6 +1735,29 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
     const next = photos.filter((_, i) => i !== idx);
     setPhotos(next);
     await cloudSet(`photos:${cleaning.id}`, JSON.stringify(next));
+  };
+  const handleVideo = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setUploadingVideo(true); setVideoMsg("");
+    try {
+      const meta = await uploadVideoToStorage(file, cleaning.id);
+      const next = [...videos, meta];
+      setVideos(next);
+      await cloudSet(`videos:${cleaning.id}`, JSON.stringify(next));
+    } catch (err) {
+      console.error("Erreur envoi vidéo :", err);
+      setVideoMsg("L'envoi de la vidéo a échoué. Vérifie ta connexion et réessaie.");
+    }
+    setUploadingVideo(false);
+    e.target.value = "";
+  };
+  const removeVideo = async (idx) => {
+    const v = videos[idx];
+    const next = videos.filter((_, i) => i !== idx);
+    setVideos(next);
+    await cloudSet(`videos:${cleaning.id}`, JSON.stringify(next));
+    deleteVideoFromStorage(v?.path);
   };
   const saveNotes = () => onUpdate({ notes });
 
@@ -1706,6 +1865,23 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
               {shareMsg && <p style={{ color: C.terracotta }} className="text-xs mb-3">{shareMsg}</p>}
             </>
           )}
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2 mt-5">Vidéos</p>
+          <div className="flex flex-wrap gap-2 mb-2">
+            {loadingVideos ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : videos.map((v, i) => (
+              <div key={i} className="relative">
+                <a href={v.url} target="_blank" rel="noopener noreferrer">
+                  <video src={v.url} muted playsInline className="w-20 h-20 object-cover rounded-lg" style={{ background: C.linenSoft }} />
+                </a>
+                <button onClick={() => removeVideo(i)} className="absolute -top-1.5 -right-1.5 rounded-full p-0.5" style={{ background: C.ink }}><Icon name="x" size={11} color="#fff" /></button>
+              </div>
+            ))}
+            <label className="w-20 h-20 rounded-lg flex items-center justify-center border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
+              {uploadingVideo ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="video" size={18} color={C.taupe} />}
+              <input type="file" accept="video/*" capture="environment" className="hidden" onChange={handleVideo} />
+            </label>
+          </div>
+          <p style={{ color: C.taupe }} className="text-xs mb-2">Les vidéos sont envoyées en ligne (peut prendre un moment selon la connexion) et visibles par toute l'équipe. Appuie sur une vidéo pour la lire en plein écran.</p>
+          {videoMsg && <p style={{ color: C.terracotta }} className="text-xs mb-3">{videoMsg}</p>}
         </>
       )}
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Notes</p>
@@ -2675,7 +2851,95 @@ function BackupSection({ profile, properties, cleanings, reservations, team, sav
   );
 }
 
-// Génère et télécharge un fichier Excel (.xlsx) reprenant toutes les
+// Export d'un .zip contenant un dossier par mission avec ses photos et
+// vidéos en fichiers réels, avec partage direct (mail, WhatsApp…) ou
+// téléchargement classique en repli.
+function MediaExportSection({ profile, properties, cleanings }) {
+  const [scope, setScope] = useState("month");
+  const [building, setBuilding] = useState(false);
+  const [progress, setProgress] = useState(null);
+  const [msg, setMsg] = useState("");
+
+  if (profile.role !== "owner") return null;
+
+  const now = new Date();
+  const monthLabel = now.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
+  const monthStartISO = isoOf(now.getFullYear(), now.getMonth(), 1);
+  const nextMonthStartISO = isoOf(now.getFullYear(), now.getMonth() + 1, 1);
+  const yearLabel = String(now.getFullYear());
+  const yearStartISO = `${now.getFullYear()}-01-01`;
+  const yearEndISO = `${now.getFullYear() + 1}-01-01`;
+
+  const scopeRange = () => {
+    if (scope === "month") return { startISO: monthStartISO, endISO: nextMonthStartISO, label: monthLabel };
+    if (scope === "year") return { startISO: yearStartISO, endISO: yearEndISO, label: yearLabel };
+    return { startISO: null, endISO: null, label: "tout" };
+  };
+
+  const run = async (mode) => {
+    setBuilding(true); setMsg(""); setProgress({ done: 0, total: 0 });
+    try {
+      const { startISO, endISO, label } = scopeRange();
+      const blob = await buildMediaExportZip({
+        properties, cleanings, startISO, endISOExclusive: endISO,
+        onProgress: (done, total) => setProgress({ done, total }),
+      });
+      if (!blob) {
+        setMsg("Aucune photo ni vidéo trouvée pour cette période.");
+      } else {
+        const filename = `photos-videos-${label}-${todayISO()}.zip`.replace(/\s+/g, "-");
+        if (mode === "share") await shareOrDownloadBlob(blob, filename, "application/zip");
+        else downloadBlob(blob, filename);
+      }
+    } catch (e) {
+      console.error("Erreur export médias :", e);
+      setMsg(e?.message || "L'export a échoué. Réessaie.");
+    }
+    setBuilding(false); setProgress(null);
+  };
+
+  return (
+    <div className="mb-6">
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Exporter photos & vidéos</p>
+      <div className="rounded-2xl p-3" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
+        <p style={{ color: C.taupe }} className="text-xs mb-3">Crée un fichier .zip avec un dossier par mission, contenant ses photos et vidéos.</p>
+        <div className="flex gap-2 mb-3">
+          <button onClick={() => setScope("month")} className="flex-1 py-2 rounded-lg text-xs font-medium border capitalize"
+            style={{ background: scope === "month" ? C.ink : "transparent", color: scope === "month" ? "#fff" : C.taupe, borderColor: C.ink }}>
+            {monthLabel}
+          </button>
+          <button onClick={() => setScope("year")} className="flex-1 py-2 rounded-lg text-xs font-medium border"
+            style={{ background: scope === "year" ? C.ink : "transparent", color: scope === "year" ? "#fff" : C.taupe, borderColor: C.ink }}>
+            Année {yearLabel}
+          </button>
+          <button onClick={() => setScope("all")} className="flex-1 py-2 rounded-lg text-xs font-medium border"
+            style={{ background: scope === "all" ? C.ink : "transparent", color: scope === "all" ? "#fff" : C.taupe, borderColor: C.ink }}>
+            Tout
+          </button>
+        </div>
+        <div className="flex gap-2">
+          <button onClick={() => run("download")} disabled={building}
+            className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.linenSoft, color: C.ink }}>
+            {building ? <div className="animate-spin"><Icon name="loader" size={15} color={C.taupe} /></div> : <Icon name="download" size={15} color={C.taupe} />}
+            Télécharger
+          </button>
+          <button onClick={() => run("share")} disabled={building}
+            className="flex-1 py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+            {building ? <div className="animate-spin"><Icon name="loader" size={15} /></div> : <Icon name="share" size={15} />}
+            Partager (mail, WhatsApp…)
+          </button>
+        </div>
+        {building && progress && progress.total > 0 && (
+          <p style={{ color: C.taupe }} className="text-xs mt-2">Préparation… {progress.done}/{progress.total} missions</p>
+        )}
+        {msg && <p style={{ color: C.terracotta }} className="text-xs mt-2">{msg}</p>}
+        <p style={{ color: C.taupe }} className="text-xs mt-2">Les fichiers volumineux (beaucoup de vidéos) peuvent être trop lourds pour un envoi par mail — privilégie WhatsApp ou un service comme Drive si besoin.</p>
+      </div>
+    </div>
+  );
+}
+
+
 // données affichées sur la page Statistiques pour le mois consulté.
 function exportStatsToExcel({ monthLabel, occupancy, byPerson, timeByPerson, timeByProperty, arriveeByPerson, arriveeByProperty, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf }) {
   const wb = XLSX.utils.book_new();
@@ -2853,6 +3117,8 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
 
       <BackupSection profile={profile} properties={properties} cleanings={cleanings} reservations={reservations} team={team}
         saveProperties={saveProperties} saveCleanings={saveCleanings} saveReservations={saveReservations} saveTeam={saveTeam} />
+
+      <MediaExportSection profile={profile} properties={properties} cleanings={cleanings} />
 
       {properties.length === 0 ? (
         <EmptyState icon="home" text="Ajoute un logement pour voir apparaître tes statistiques." />
