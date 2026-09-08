@@ -16,10 +16,10 @@
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
 <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-<script src="https://unpkg.com/[email protected]/dist/xlsx.full.min.js"></script>
-<script src="https://unpkg.com/[email protected]/build/index.umd.min.js"></script>
-<script src="https://unpkg.com/[email protected]/dist/jszip.min.js"></script>
-<script src="https://unpkg.com/[email protected]/dist/html2canvas.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://unpkg.com/docx@8.5.0/build/index.umd.js"></script>
+<script src="https://unpkg.com/jszip@3.10.1/dist/jszip.min.js"></script>
+<script src="https://unpkg.com/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
@@ -406,7 +406,7 @@ function ensureDocxLoaded() {
       return;
     }
     const script = document.createElement("script");
-    script.src = "https://cdn.jsdelivr.net/npm/[email protected]/build/index.umd.min.js";
+    script.src = "https://cdn.jsdelivr.net/npm/docx@8.5.0/build/index.umd.js";
     script.setAttribute("data-docx-fallback", "1");
     script.onload = () => { if (window.docx) resolve(); else reject(new Error("La bibliothèque Word s'est chargée mais n'a pas pu s'initialiser.")); };
     script.onerror = () => reject(new Error("La bibliothèque Word n'a pas pu se charger, même en secours. Vérifie ta connexion internet ou désactive temporairement un bloqueur de publicités/scripts pour ce site."));
