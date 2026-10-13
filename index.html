@@ -323,6 +323,7 @@ function Icon({ name, size = 18, color = "currentColor", strokeWidth = 2 }) {
     share: "M18 8a3 3 0 1 0-2.83-4 M6 12a3 3 0 1 0 0 0 M18 20a3 3 0 1 0-2.83-4 M8.6 10.5l6.8-3.8 M8.6 13.5l6.8 3.8",
     key: "M15 7a4 4 0 1 0-3.9 4H15l2 2 2-2 2 2 2-2-2-2h-4.1",
     video: "M3 7a1 1 0 0 1 1-1h10a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7Z M15 10l6-3.5v11L15 14Z",
+    list: "M8 6h12 M8 12h12 M8 18h12 M3 6h.01 M3 12h.01 M3 18h.01",
   };
   return (
     <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke={color}
@@ -669,6 +670,12 @@ async function generateCleaningReport(cleaning, property, person, photos) {
     children.push(new Paragraph({ children: [new TextRun({ text: cleaning.notes, size: 20 })] }));
   }
 
+  // Problème logement
+  if (cleaning.issue) {
+    children.push(new Paragraph({ text: "Problème logement signalé", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
+    children.push(new Paragraph({ children: [new TextRun({ text: cleaning.issue, size: 20, color: "C1552F" })] }));
+  }
+
   // Photos (déjà stockées par l'appli pour ce ménage)
   children.push(new Paragraph({ text: "Photos prises sur place", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
   if (!photos || photos.length === 0) {
@@ -788,6 +795,58 @@ async function generateMonthlyJournal({ monthLabel, properties, cleanings, team,
   const a = document.createElement("a");
   a.href = url;
   a.download = `journal-de-bord-${monthLabel}.docx`.replace(/\s+/g, "-");
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// Rapport global (.docx) listant tous les problèmes logement signalés,
+// tous logements et missions confondus (passées ou en cours) : une ligne
+// par mission concernée, avec la date, le logement et le problème.
+async function generateIssuesReport(properties, cleanings) {
+  const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType } = docx;
+  const propertyOf = (id) => properties.find((p) => p.id === id);
+  const withIssue = cleanings.filter((c) => c.issue && c.issue.trim()).sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  const children = [];
+  children.push(new Paragraph({
+    children: [new TextRun({ text: "Problèmes logement", bold: true, size: 40, color: "20261F" })],
+    spacing: { after: 80 },
+  }));
+  children.push(new Paragraph({
+    children: [new TextRun({ text: `Tous logements — ${withIssue.length} signalement${withIssue.length !== 1 ? "s" : ""}`, size: 24, color: "7C6B9C", bold: true })],
+    spacing: { after: 300 },
+  }));
+
+  if (withIssue.length === 0) {
+    children.push(new Paragraph({ children: [new TextRun({ text: "Aucun problème signalé pour l'instant.", italics: true, size: 20 })] }));
+  } else {
+    const headerCell = (text) => new TableCell({
+      shading: { fill: "20261F" },
+      children: [new Paragraph({ children: [new TextRun({ text, bold: true, size: 18, color: "FFFFFF" })] })],
+    });
+    const bodyCell = (text) => new TableCell({ children: [new Paragraph({ children: [new TextRun({ text: String(text || "—"), size: 18 })] })] });
+
+    const rows = [new TableRow({ children: [headerCell("Date"), headerCell("Logement"), headerCell("Problème")] })];
+    withIssue.forEach((c) => {
+      const property = propertyOf(c.propertyId);
+      rows.push(new TableRow({ children: [bodyCell(fmtDate(c.date)), bodyCell(property?.name || "Logement supprimé"), bodyCell(c.issue)] }));
+    });
+    children.push(new Table({ width: { size: 100, type: WidthType.PERCENTAGE }, rows }));
+  }
+
+  children.push(new Paragraph({
+    children: [new TextRun({ text: `Rapport généré le ${new Date().toLocaleDateString("fr-FR")} via Planning Ménage.`, italics: true, size: 16, color: "9C9284" })],
+    spacing: { before: 400 },
+  }));
+
+  const doc = new Document({ sections: [{ properties: {}, children }], styles: { default: { document: { run: { font: "Calibri" } } } } });
+  const blob = await Packer.toBlob(doc);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `problemes-logement-${todayISO()}.docx`;
   document.body.appendChild(a);
   a.click();
   a.remove();
@@ -1682,6 +1741,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const [addingKit, setAddingKit] = useState(false);
   const [dirtyQty, setDirtyQty] = useState(1);
   const [notes, setNotes] = useState(cleaning.notes || "");
+  const [issue, setIssue] = useState(cleaning.issue || "");
   const [editing, setEditing] = useState(false);
   const [generatingReport, setGeneratingReport] = useState(false);
   const [reportMsg, setReportMsg] = useState("");
@@ -1719,14 +1779,19 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   }
 
   const handlePhoto = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
     setUploading(true);
     try {
-      const dataUrl = await compressImage(file);
-      const next = [...photos, dataUrl];
-      setPhotos(next);
-      await cloudSet(`photos:${cleaning.id}`, JSON.stringify(next));
+      const added = [];
+      for (const file of files) {
+        try { added.push(await compressImage(file)); } catch (err) {}
+      }
+      if (added.length > 0) {
+        const next = [...photos, ...added];
+        setPhotos(next);
+        await cloudSet(`photos:${cleaning.id}`, JSON.stringify(next));
+      }
     } catch (err) {}
     setUploading(false);
     e.target.value = "";
@@ -1737,17 +1802,22 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
     await cloudSet(`photos:${cleaning.id}`, JSON.stringify(next));
   };
   const handleVideo = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+    const files = Array.from(e.target.files || []);
+    if (files.length === 0) return;
     setUploadingVideo(true); setVideoMsg("");
     try {
-      const meta = await uploadVideoToStorage(file, cleaning.id);
-      const next = [...videos, meta];
-      setVideos(next);
-      await cloudSet(`videos:${cleaning.id}`, JSON.stringify(next));
+      const added = [];
+      for (const file of files) {
+        try { added.push(await uploadVideoToStorage(file, cleaning.id)); } catch (err) { console.error("Erreur envoi vidéo :", err); }
+      }
+      if (added.length > 0) {
+        const next = [...videos, ...added];
+        setVideos(next);
+        await cloudSet(`videos:${cleaning.id}`, JSON.stringify(next));
+      }
+      if (added.length < files.length) setVideoMsg("Une ou plusieurs vidéos n'ont pas pu être envoyées. Vérifie ta connexion et réessaie.");
     } catch (err) {
-      console.error("Erreur envoi vidéo :", err);
-      setVideoMsg("L'envoi de la vidéo a échoué. Vérifie ta connexion et réessaie.");
+      setVideoMsg("L'envoi des vidéos a échoué. Vérifie ta connexion et réessaie.");
     }
     setUploadingVideo(false);
     e.target.value = "";
@@ -1760,9 +1830,13 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
     deleteVideoFromStorage(v?.path);
   };
   const saveNotes = () => onUpdate({ notes });
+  const saveIssue = () => onUpdate({ issue });
 
   return (
     <Sheet onClose={onClose} title={`${isArrival ? "Arrivée client" : "Ménage"}${property?.name ? " — " + property.name : ""}`}>
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Notes</p>
+      <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. clé sous le pot, interphone en panne…" rows={3}
+        className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
       <div style={{ color: C.taupe }} className="flex items-center gap-3 text-sm mb-4">
         <span className="flex items-center gap-1"><Icon name="calendar" size={14} />{fmtDate(cleaning.date)}</span>
         <span className="flex items-center gap-1"><Icon name="clock" size={14} />{cleaning.time}</span>
@@ -1777,6 +1851,14 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
             style={{ background: cleaning.status === key ? s.color : "transparent", color: cleaning.status === key ? "#fff" : s.color, borderColor: s.color }}>{s.label}</button>
         ))}
       </div>
+      {property?.ownerSmsValidationEnabled && cleaning.status === "termine" && (
+        <div className="rounded-xl px-3 py-2.5 mb-5 flex items-center gap-2" style={{ background: cleaning.ownerValidated ? "#DDE7DF" : "#F1E3C4" }}>
+          <Icon name="phone" size={14} color={cleaning.ownerValidated ? C.sauge : C.or} />
+          <p style={{ color: cleaning.ownerValidated ? C.sauge : C.or }} className="text-xs font-medium">
+            {cleaning.ownerValidated ? "Validé par le propriétaire par SMS" : cleaning.ownerSmsSent ? "SMS envoyé au propriétaire, en attente de sa réponse" : "SMS de validation en cours d'envoi…"}
+          </p>
+        </div>
+      )}
       {!isArrival && property && (
         <div className="mb-5">
           <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Linge de ce logement</p>
@@ -1840,9 +1922,15 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
                 <button onClick={() => removePhoto(i)} className="absolute -top-1.5 -right-1.5 rounded-full p-0.5" style={{ background: C.ink }}><Icon name="x" size={11} color="#fff" /></button>
               </div>
             ))}
-            <label className="w-20 h-20 rounded-lg flex items-center justify-center border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
+            <label className="w-20 h-20 rounded-lg flex flex-col items-center justify-center gap-1 border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
               {uploading ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="camera" size={18} color={C.taupe} />}
+              <span style={{ color: C.taupe }} className="text-[10px] font-medium">Prendre</span>
               <input type="file" accept="image/*" capture="environment" className="hidden" onChange={handlePhoto} />
+            </label>
+            <label className="w-20 h-20 rounded-lg flex flex-col items-center justify-center gap-1 border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
+              {uploading ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="download" size={18} color={C.taupe} />}
+              <span style={{ color: C.taupe }} className="text-[10px] font-medium">Galerie</span>
+              <input type="file" accept="image/*" multiple className="hidden" onChange={handlePhoto} />
             </label>
           </div>
           <p style={{ color: C.taupe }} className="text-xs mb-2">Les photos sont visibles par toute l'équipe.</p>
@@ -1875,17 +1963,23 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
                 <button onClick={() => removeVideo(i)} className="absolute -top-1.5 -right-1.5 rounded-full p-0.5" style={{ background: C.ink }}><Icon name="x" size={11} color="#fff" /></button>
               </div>
             ))}
-            <label className="w-20 h-20 rounded-lg flex items-center justify-center border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
+            <label className="w-20 h-20 rounded-lg flex flex-col items-center justify-center gap-1 border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
               {uploadingVideo ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="video" size={18} color={C.taupe} />}
+              <span style={{ color: C.taupe }} className="text-[10px] font-medium">Filmer</span>
               <input type="file" accept="video/*" capture="environment" className="hidden" onChange={handleVideo} />
+            </label>
+            <label className="w-20 h-20 rounded-lg flex flex-col items-center justify-center gap-1 border-2 border-dashed cursor-pointer" style={{ borderColor: C.taupeLight }}>
+              {uploadingVideo ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : <Icon name="download" size={18} color={C.taupe} />}
+              <span style={{ color: C.taupe }} className="text-[10px] font-medium">Galerie</span>
+              <input type="file" accept="video/*" multiple className="hidden" onChange={handleVideo} />
             </label>
           </div>
           <p style={{ color: C.taupe }} className="text-xs mb-2">Les vidéos sont envoyées en ligne (peut prendre un moment selon la connexion) et visibles par toute l'équipe. Appuie sur une vidéo pour la lire en plein écran.</p>
           {videoMsg && <p style={{ color: C.terracotta }} className="text-xs mb-3">{videoMsg}</p>}
         </>
       )}
-      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Notes</p>
-      <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. clé sous le pot, interphone en panne…" rows={3}
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Problèmes logement</p>
+      <textarea value={issue} onChange={(e) => setIssue(e.target.value)} onBlur={saveIssue} placeholder="Ex. chauffe-eau en panne, volet cassé…" rows={3}
         className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
 
       <button
@@ -2359,9 +2453,54 @@ function ReservationDetail({ reservation, property, profile, onClose, onUpdate, 
 /* =========================================================
    PROPRIÉTÉS TAB
 ========================================================= */
+// Liste du linge d'un logement (nom + quantité), repliée par défaut,
+// modifiable ligne par ligne directement depuis l'onglet Logements.
+function LinenInventoryEditor({ property, onUpdate }) {
+  const inventory = property.linenInventory || [];
+  const [newName, setNewName] = useState("");
+  const [newQty, setNewQty] = useState("1");
+
+  const addItem = () => {
+    if (!newName.trim()) return;
+    const qty = Math.max(0, parseInt(newQty, 10) || 0);
+    onUpdate({ linenInventory: [...inventory, { id: uid(), name: newName.trim(), qty }] });
+    setNewName("");
+    setNewQty("1");
+  };
+  const updateItem = (id, patch) => onUpdate({ linenInventory: inventory.map((it) => (it.id === id ? { ...it, ...patch } : it)) });
+  const removeItem = (id) => onUpdate({ linenInventory: inventory.filter((it) => it.id !== id) });
+
+  return (
+    <div className="mt-3 pt-3 rounded-xl px-3 py-3" style={{ background: C.linenSoft }} onClick={(e) => e.stopPropagation()}>
+      {inventory.length === 0 && <p style={{ color: C.taupe }} className="text-xs mb-2">Aucun article pour l'instant.</p>}
+      <div className="flex flex-col gap-2 mb-2">
+        {inventory.map((item) => (
+          <div key={item.id} className="flex items-center gap-2">
+            <input value={item.name} onChange={(e) => updateItem(item.id, { name: e.target.value })}
+              className="flex-1 px-2.5 py-1.5 rounded-lg text-sm outline-none" style={{ background: "#fff", color: C.ink }} />
+            <input type="number" min="0" value={item.qty} onChange={(e) => updateItem(item.id, { qty: Math.max(0, parseInt(e.target.value, 10) || 0) })}
+              className="w-16 px-2 py-1.5 rounded-lg text-sm text-center outline-none" style={{ background: "#fff", color: C.ink }} />
+            <button onClick={() => removeItem(item.id)}><Icon name="x" size={14} color={C.taupe} /></button>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2">
+        <input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder="Ex. Draps 160x200"
+          className="flex-1 px-2.5 py-1.5 rounded-lg text-sm outline-none" style={{ background: "#fff", color: C.ink }}
+          onKeyDown={(e) => e.key === "Enter" && addItem()} />
+        <input type="number" min="0" value={newQty} onChange={(e) => setNewQty(e.target.value)}
+          className="w-16 px-2 py-1.5 rounded-lg text-sm text-center outline-none" style={{ background: "#fff", color: C.ink }}
+          onKeyDown={(e) => e.key === "Enter" && addItem()} />
+        <button onClick={addItem} className="px-3 py-1.5 rounded-lg" style={{ background: C.ink }}><Icon name="plus" size={14} color={C.linen} /></button>
+      </div>
+    </div>
+  );
+}
+
 function ProprietesTab({ profile, properties, saveProperties, cleanings, saveCleanings, reservations, saveReservations }) {
   const [showForm, setShowForm] = useState(false);
   const [openId, setOpenId] = useState(null);
+  const [inventoryOpenId, setInventoryOpenId] = useState(null);
   const openProperty = openId ? properties.find((p) => p.id === openId) : null;
 
   return (
@@ -2376,15 +2515,27 @@ function ProprietesTab({ profile, properties, saveProperties, cleanings, saveCle
       <div className="flex flex-col gap-3">
         {properties.map((p) => {
           const active = cleanings.filter((c) => c.propertyId === p.id && c.status !== "termine").length;
+          const inventoryOpen = inventoryOpenId === p.id;
           return (
-            <button key={p.id} onClick={() => setOpenId(p.id)} className="w-full text-left rounded-2xl px-4 py-3 flex items-center justify-between" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
-              <div>
-                <h3 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="font-semibold text-[15px]">{p.name}</h3>
-                {p.address && <p style={{ color: C.taupe }} className="text-xs mt-0.5">{p.address}</p>}
-                <p style={{ color: C.taupe }} className="text-xs mt-1">{p.checklist?.length || 0} tâches · {active} ménage{active !== 1 ? "s" : ""} en attente</p>
-              </div>
-              <Icon name="chevronRight" size={18} color={C.taupe} />
-            </button>
+            <div key={p.id} className="w-full rounded-2xl px-4 py-3" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
+              <button onClick={() => setOpenId(p.id)} className="w-full text-left flex items-center justify-between">
+                <div>
+                  <h3 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="font-semibold text-[15px]">{p.name}</h3>
+                  {p.address && <p style={{ color: C.taupe }} className="text-xs mt-0.5">{p.address}</p>}
+                  <p style={{ color: C.taupe }} className="text-xs mt-1">{p.checklist?.length || 0} tâches · {active} ménage{active !== 1 ? "s" : ""} en attente</p>
+                </div>
+                <Icon name="chevronRight" size={18} color={C.taupe} />
+              </button>
+              <button onClick={() => setInventoryOpenId(inventoryOpen ? null : p.id)}
+                className="mt-2 flex items-center gap-1.5 text-xs font-semibold" style={{ color: C.sauge }}>
+                <Icon name="list" size={13} color={C.sauge} />
+                Inventaire du linge{p.linenInventory?.length ? ` (${p.linenInventory.length})` : ""}
+                <Icon name={inventoryOpen ? "chevronUp" : "chevronDown"} size={13} color={C.sauge} />
+              </button>
+              {inventoryOpen && (
+                <LinenInventoryEditor property={p} onUpdate={(patch) => saveProperties(properties.map((pp) => (pp.id === p.id ? { ...pp, ...patch } : pp)))} />
+              )}
+            </div>
           );
         })}
       </div>
@@ -2441,6 +2592,7 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const [newItem, setNewItem] = useState("");
   const [notes, setNotes] = useState(property.notes || "");
   const [ownerName, setOwnerName] = useState(property.ownerName || "");
+  const [ownerPhone, setOwnerPhone] = useState(property.ownerPhone || "");
   const [conciergerieName, setConciergerieName] = useState(property.conciergerieName || "");
   const [kitPrice, setKitPrice] = useState(property.kitPrice != null ? String(property.kitPrice) : "15");
   const [defaultCleaningPrice, setDefaultCleaningPrice] = useState(property.defaultCleaningPrice != null ? String(property.defaultCleaningPrice) : "");
@@ -2456,6 +2608,8 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const removeItem = (id) => onUpdate({ checklist: property.checklist.filter((i) => i.id !== id) });
   const saveNotes = () => onUpdate({ notes });
   const saveOwnerName = () => onUpdate({ ownerName: ownerName.trim() });
+  const saveOwnerPhone = () => onUpdate({ ownerPhone: ownerPhone.trim() });
+  const toggleOwnerSmsValidation = () => onUpdate({ ownerSmsValidationEnabled: !property.ownerSmsValidationEnabled });
   const saveConciergerieName = () => onUpdate({ conciergerieName: conciergerieName.trim() });
   const saveKitPrice = () => onUpdate({ kitPrice: Number(kitPrice) || 0 });
   const saveDefaultCleaningPrice = () => onUpdate({ defaultCleaningPrice: defaultCleaningPrice.trim() === "" ? null : Number(defaultCleaningPrice) });
@@ -2520,9 +2674,20 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
           <Field label="Nom du propriétaire">
             <input value={ownerName} onChange={(e) => setOwnerName(e.target.value)} onBlur={saveOwnerName} placeholder="Ex. Julien Thomas" style={selectStyle} />
           </Field>
+          <Field label="Téléphone du propriétaire">
+            <input type="tel" value={ownerPhone} onChange={(e) => setOwnerPhone(e.target.value)} onBlur={saveOwnerPhone} placeholder="Ex. 06 12 34 56 78" style={selectStyle} />
+          </Field>
           <Field label="Conciergerie">
             <input value={conciergerieName} onChange={(e) => setConciergerieName(e.target.value)} onBlur={saveConciergerieName} placeholder="Ex. We Rent Atlantic" style={selectStyle} />
           </Field>
+          <div className="flex items-end pb-1">
+            <button onClick={toggleOwnerSmsValidation} disabled={!ownerPhone.trim()}
+              className="w-full py-2.5 rounded-xl text-xs font-medium flex items-center justify-center gap-1.5 disabled:opacity-40"
+              style={{ background: property.ownerSmsValidationEnabled ? C.sauge : C.linenSoft, color: property.ownerSmsValidationEnabled ? "#fff" : C.taupe }}>
+              <Icon name="phone" size={13} />
+              {property.ownerSmsValidationEnabled ? "Validation SMS activée" : "Activer validation SMS"}
+            </button>
+          </div>
         </div>
       )}
 
@@ -2939,6 +3104,45 @@ function MediaExportSection({ profile, properties, cleanings }) {
   );
 }
 
+// Export Word listant tous les problèmes logement signalés sur l'ensemble
+// des ménages (passés ou en cours), tous logements confondus.
+function IssuesReportSection({ profile, properties, cleanings }) {
+  const [generating, setGenerating] = useState(false);
+  const [msg, setMsg] = useState("");
+
+  if (profile.role !== "owner") return null;
+
+  const count = cleanings.filter((c) => c.issue && c.issue.trim()).length;
+
+  const run = async () => {
+    setGenerating(true); setMsg("");
+    try {
+      if (!window.docx) await ensureDocxLoaded();
+      await generateIssuesReport(properties, cleanings);
+    } catch (e) {
+      console.error("Erreur export problèmes logement :", e);
+      setMsg(e?.message || "L'export a échoué. Réessaie.");
+    }
+    setGenerating(false);
+  };
+
+  return (
+    <div className="mb-6">
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Problèmes logement</p>
+      <div className="rounded-2xl p-3" style={{ background: "#FFFDF8", border: `1px solid ${C.taupeLight}` }}>
+        <p style={{ color: C.taupe }} className="text-xs mb-3">
+          Exporte un Word avec la date, le logement et le problème, pour tous les ménages (passés ou en cours) où un problème a été signalé{count > 0 ? ` (${count} actuellement)` : ""}.
+        </p>
+        <button onClick={run} disabled={generating}
+          className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+          {generating ? <div className="animate-spin"><Icon name="loader" size={15} /></div> : <Icon name="download" size={15} />}
+          Exporter les problèmes logement (Word)
+        </button>
+        {msg && <p style={{ color: C.terracotta }} className="text-xs mt-2">{msg}</p>}
+      </div>
+    </div>
+  );
+}
 
 // données affichées sur la page Statistiques pour le mois consulté.
 function exportStatsToExcel({ monthLabel, occupancy, byPerson, timeByPerson, timeByProperty, arriveeByPerson, arriveeByProperty, late, revenueByProperty, kitsByProperty, selfWashByProperty, propertyOf, personOf }) {
@@ -3119,6 +3323,8 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
         saveProperties={saveProperties} saveCleanings={saveCleanings} saveReservations={saveReservations} saveTeam={saveTeam} />
 
       <MediaExportSection profile={profile} properties={properties} cleanings={cleanings} />
+
+      <IssuesReportSection profile={profile} properties={properties} cleanings={cleanings} />
 
       {properties.length === 0 ? (
         <EmptyState icon="home" text="Ajoute un logement pour voir apparaître tes statistiques." />
