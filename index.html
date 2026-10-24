@@ -477,6 +477,22 @@ function gcalDisconnect(profileId) {
   localStorage.removeItem(`gcal-token:${profileId}`);
   localStorage.removeItem(`gcal-connected:${profileId}`);
   localStorage.removeItem(`gcal-ledger:${profileId}`);
+  localStorage.removeItem(`gcal-email:${profileId}`);
+}
+// Adresse Google avec laquelle cet appareil a été connecté (vide si la
+// connexion date d'avant le choix d'adresse, ou si aucune n'était choisie).
+function gcalConnectedEmail(profileId) {
+  return localStorage.getItem(`gcal-email:${profileId}`) || "";
+}
+// Chaque personne de l'équipe peut enregistrer deux adresses de
+// synchronisation et choisir laquelle est active (gcalEmail1 / gcalEmail2,
+// gcalEmailChoice = "1" ou "2"). Si l'adresse choisie est vide, on se rabat
+// sur l'autre.
+function gcalActiveEmail(member) {
+  if (!member) return "";
+  const e1 = (member.gcalEmail1 || "").trim();
+  const e2 = (member.gcalEmail2 || "").trim();
+  return member.gcalEmailChoice === "2" ? (e2 || e1) : (e1 || e2);
 }
 function gcalLedger(profileId) {
   try { return JSON.parse(localStorage.getItem(`gcal-ledger:${profileId}`) || "{}"); } catch (e) { return {}; }
@@ -487,7 +503,7 @@ function gcalSaveLedger(profileId, ledger) {
 function gcalTokenClient(callback) {
   return google.accounts.oauth2.initTokenClient({ client_id: window.__GOOGLE_CLIENT_ID__, scope: GCAL_SCOPE, callback });
 }
-function gcalConnect(profileId) {
+function gcalConnect(profileId, hintEmail) {
   return new Promise((resolve, reject) => {
     if (!gcalConfigured()) { reject(new Error("not-configured")); return; }
     try {
@@ -495,9 +511,13 @@ function gcalConnect(profileId) {
         if (resp.error) { reject(resp); return; }
         localStorage.setItem(`gcal-token:${profileId}`, JSON.stringify({ token: resp.access_token, expiresAt: Date.now() + (resp.expires_in - 60) * 1000 }));
         localStorage.setItem(`gcal-connected:${profileId}`, "1");
+        localStorage.setItem(`gcal-email:${profileId}`, hintEmail || "");
         resolve(resp.access_token);
       });
-      client.requestAccessToken({ prompt: "consent" });
+      // "hint" pré-sélectionne le bon compte dans la fenêtre Google.
+      const opts = { prompt: "consent" };
+      if (hintEmail) opts.hint = hintEmail;
+      client.requestAccessToken(opts);
     } catch (e) { reject(e); }
   });
 }
@@ -516,7 +536,8 @@ function gcalGetToken(profileId) {
         localStorage.setItem(`gcal-token:${profileId}`, JSON.stringify({ token: resp.access_token, expiresAt: Date.now() + (resp.expires_in - 60) * 1000 }));
         resolve(resp.access_token);
       });
-      client.requestAccessToken({ prompt: "" });
+      const hint = gcalConnectedEmail(profileId);
+      client.requestAccessToken(hint ? { prompt: "", hint } : { prompt: "" });
     } catch (e) { resolve(null); }
   });
 }
@@ -1261,7 +1282,7 @@ function App() {
         </main>
       </div>
       {showGCal && (
-        <GoogleAgendaPanel profile={profile} cleanings={cleanings} properties={properties} onClose={() => setShowGCal(false)} />
+        <GoogleAgendaPanel profile={profile} team={team} cleanings={cleanings} properties={properties} onClose={() => setShowGCal(false)} />
       )}
     </div>
   );
@@ -1369,22 +1390,29 @@ function TabBar({ tab, setTab, role }) {
 /* =========================================================
    GOOGLE AGENDA — panneau de connexion et synchronisation
 ========================================================= */
-function GoogleAgendaPanel({ profile, cleanings, properties, onClose }) {
+function GoogleAgendaPanel({ profile, team, cleanings, properties, onClose }) {
   const [connected, setConnected] = useState(gcalIsConnected(profile.id));
+  const [connectedEmail, setConnectedEmail] = useState(gcalConnectedEmail(profile.id));
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState("");
   const myCount = cleanings.filter((c) => c.assignedToId === profile.id).length;
+  const member = (team || []).find((t) => t.id === profile.id);
+  const activeEmail = gcalActiveEmail(member);
+  // L'adresse choisie dans Équipe n'est plus celle avec laquelle cet appareil
+  // est connecté : il faut basculer pour que les ménages aillent dans le bon agenda.
+  const mismatch = connected && !!activeEmail && !!connectedEmail && connectedEmail.toLowerCase() !== activeEmail.toLowerCase();
 
   const doConnect = async () => {
     setBusy(true); setMsg("");
     try {
-      await gcalConnect(profile.id);
+      await gcalConnect(profile.id, activeEmail);
       setConnected(true);
+      setConnectedEmail(activeEmail);
       const res = await syncMyCleanings(profile, cleanings, properties);
       setMsg(`Connecté ! ${res.created} événement${res.created > 1 ? "s" : ""} créé${res.created > 1 ? "s" : ""}.`);
     } catch (e) {
       if (e?.message === "not-configured") setMsg("La connexion Google Agenda n'est pas encore configurée pour cette appli — voir README.md.");
-      else setMsg("La connexion a échoué ou a été annulée. Réessaie.");
+      else setMsg("La connexion a échoué ou a été annulée. Si Google affiche « accès bloqué », l'adresse doit d'abord être ajoutée comme utilisateur test dans Google Cloud.");
     }
     setBusy(false);
   };
@@ -1401,14 +1429,52 @@ function GoogleAgendaPanel({ profile, cleanings, properties, onClose }) {
   const doDisconnect = () => {
     gcalDisconnect(profile.id);
     setConnected(false);
+    setConnectedEmail("");
     setMsg("Déconnecté de cette appli. Tes événements déjà créés restent dans ton agenda.");
+  };
+  // Bascule vers l'autre adresse : on retire d'abord les événements de
+  // l'ancien agenda (au mieux), puis on se reconnecte avec la nouvelle adresse
+  // et on resynchronise tout.
+  const doSwitch = async () => {
+    setBusy(true); setMsg("");
+    try {
+      try {
+        const oldToken = await gcalGetToken(profile.id);
+        if (oldToken) {
+          const ledger = gcalLedger(profile.id);
+          for (const id of Object.keys(ledger)) {
+            try { await gcalApi("DELETE", `/calendars/primary/events/${ledger[id].eventId}`, oldToken); } catch (e) {}
+          }
+        }
+      } catch (e) {}
+      gcalDisconnect(profile.id);
+      setConnected(false);
+      await gcalConnect(profile.id, activeEmail);
+      setConnected(true);
+      setConnectedEmail(activeEmail);
+      const res = await syncMyCleanings(profile, cleanings, properties);
+      setMsg(`Basculé vers ${activeEmail} : ${res.created} événement${res.created > 1 ? "s" : ""} créé${res.created > 1 ? "s" : ""}.`);
+    } catch (e) {
+      setMsg("Le changement d'adresse a échoué ou a été annulé. Réessaie. Si Google affiche « accès bloqué », l'adresse doit d'abord être ajoutée comme utilisateur test dans Google Cloud.");
+    }
+    setBusy(false);
   };
 
   return (
     <Sheet onClose={onClose} title="Google Agenda">
       <p style={{ color: C.taupe }} className="text-sm mb-4">
-        Connecte ton agenda Google personnel : tes {myCount} ménage{myCount !== 1 ? "s" : ""} assigné{myCount !== 1 ? "s" : ""} (passés et à venir) y apparaîtront automatiquement.
+        Connecte ton agenda Google : tes {myCount} ménage{myCount !== 1 ? "s" : ""} assigné{myCount !== 1 ? "s" : ""} (passés et à venir) y apparaîtront automatiquement.
       </p>
+
+      <div className="rounded-xl px-3 py-2.5 mb-4" style={{ background: C.linenSoft }}>
+        <p style={{ color: C.taupe }} className="text-xs font-medium uppercase tracking-wide">Adresse de synchronisation</p>
+        {activeEmail ? (
+          <p style={{ color: C.ink }} className="text-sm font-medium mt-1">{activeEmail}</p>
+        ) : (
+          <p style={{ color: C.taupe }} className="text-xs mt-1">Aucune adresse choisie : Google te demandera quel compte utiliser. Tu peux en enregistrer deux dans l'onglet Équipe (ton profil).</p>
+        )}
+        {connected && connectedEmail && <p style={{ color: C.sauge }} className="text-xs mt-1">Actuellement connecté avec : {connectedEmail}</p>}
+      </div>
 
       {!connected ? (
         <button onClick={doConnect} disabled={busy} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
@@ -1421,6 +1487,14 @@ function GoogleAgendaPanel({ profile, cleanings, properties, onClose }) {
             <Icon name="check" size={14} color={C.sauge} />
             <span style={{ color: C.sauge }} className="text-sm font-medium">Agenda connecté</span>
           </div>
+          {mismatch && (
+            <div className="rounded-xl px-3 py-2.5" style={{ background: "#F1E3C4" }}>
+              <p style={{ color: C.or }} className="text-xs font-medium mb-2">Tu as choisi une autre adresse dans Équipe. Bascule pour que tes ménages aillent dans {activeEmail} (ils seront retirés de {connectedEmail}).</p>
+              <button onClick={doSwitch} disabled={busy} className="w-full py-2.5 rounded-xl text-sm font-medium disabled:opacity-50" style={{ background: C.or, color: "#fff" }}>
+                Basculer vers {activeEmail}
+              </button>
+            </div>
+          )}
           <button onClick={doSync} disabled={busy} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
             {busy ? <div className="animate-spin"><Icon name="loader" size={16} /></div> : <Icon name="calendar" size={16} />}
             Synchroniser maintenant
@@ -3606,6 +3680,9 @@ function MemberDetail({ member, team, isSelf, canEditFull, onClose, onUpdate, on
   const [companyAddress, setCompanyAddress] = useState(member.companyAddress || "");
   const [companyPhone, setCompanyPhone] = useState(member.companyPhone || "");
   const [companyEmail, setCompanyEmail] = useState(member.companyEmail || "");
+  const [gcalEmail1, setGcalEmail1] = useState(member.gcalEmail1 || "");
+  const [gcalEmail2, setGcalEmail2] = useState(member.gcalEmail2 || "");
+  const [gcalEmailChoice, setGcalEmailChoice] = useState(member.gcalEmailChoice === "2" ? "2" : "1");
   const takenColorIds = team.filter((t) => t.id !== member.id && t.color).map((t) => t.color);
   const pickColor = (colorId) => {
     if (takenColorIds.includes(colorId)) return;
@@ -3615,6 +3692,7 @@ function MemberDetail({ member, team, isSelf, canEditFull, onClose, onUpdate, on
     name: name.trim(), role, color,
     companyName: companyName.trim(), siret: siret.trim(), companyAddress: companyAddress.trim(),
     companyPhone: companyPhone.trim(), companyEmail: companyEmail.trim(),
+    gcalEmail1: gcalEmail1.trim(), gcalEmail2: gcalEmail2.trim(), gcalEmailChoice,
   });
   return (
     <Sheet onClose={onClose} title="Modifier le profil">
@@ -3655,6 +3733,30 @@ function MemberDetail({ member, team, isSelf, canEditFull, onClose, onUpdate, on
         </div>
         <p style={{ color: C.taupe }} className="text-xs">Chaque couleur ne peut être prise que par une seule personne. Les couleurs grisées sont déjà utilisées.</p>
       </Field>
+
+      <div className="h-4" />
+      <p style={{ color: C.ink }} className="text-sm font-semibold mb-1">Adresses Google Agenda</p>
+      <p style={{ color: C.taupe }} className="text-xs mb-3">Deux adresses possibles selon la situation : choisis celle qui reçoit les ménages pour ne pas surcharger un seul agenda. Chaque adresse doit d'abord être ajoutée comme utilisateur test dans Google Cloud, sinon Google bloque la connexion.</p>
+      <div className="flex flex-col gap-3">
+        {[["1", gcalEmail1, setGcalEmail1], ["2", gcalEmail2, setGcalEmail2]].map(([n, value, setValue]) => {
+          const active = gcalEmailChoice === n;
+          return (
+            <div key={n} className="flex items-end gap-2">
+              <div className="flex-1">
+                <Field label={`Adresse ${n}`}>
+                  <input type="email" value={value} onChange={(e) => setValue(e.target.value)} placeholder="prenom@gmail.com" style={selectStyle} />
+                </Field>
+              </div>
+              <button onClick={() => setGcalEmailChoice(n)} disabled={!value.trim()}
+                className="px-3 py-2.5 rounded-xl text-xs font-semibold disabled:opacity-40 shrink-0"
+                style={{ background: active ? C.sauge : C.linenSoft, color: active ? "#fff" : C.taupe }}>
+                {active ? "Active" : "Utiliser"}
+              </button>
+            </div>
+          );
+        })}
+      </div>
+      <p style={{ color: C.taupe }} className="text-xs mt-2">Après avoir changé l'adresse active, ouvre Google Agenda (icône calendrier en haut) pour basculer la synchronisation.</p>
 
       <div className="h-4" />
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-1">Informations d'entreprise</p>
