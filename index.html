@@ -191,14 +191,72 @@ async function syncLinkedMission(reservation, cleanings, saveCleanings, type, da
     }
   }
 }
-// Synchronise à la fois le ménage (départ) et, si activée sur le logement,
-// la mission d'arrivée client — à appeler après la création ou la
-// modification d'une réservation.
-async function syncReservationMissions(reservation, property, cleanings, saveCleanings) {
-  await syncLinkedMission(reservation, cleanings, saveCleanings, "menage", reservation.checkOut);
-  if (property?.keyHandoverEnabled) {
-    await syncLinkedMission(reservation, cleanings, saveCleanings, "arrivee", reservation.checkIn);
+// Vérification avant rotation : pour chaque logement où elle est activée, une
+// mission "verification" est créée le jour d'une rotation (un départ et une
+// arrivée le même jour), le matin, avant le ménage. Elle est liée à la
+// réservation qui part. Les vérifications pas encore attribuées dont la
+// rotation n'existe plus sont retirées ; celles déjà attribuées ou terminées
+// ne sont jamais supprimées automatiquement.
+function applyVerifications(reservations, properties, cleanings) {
+  let next = [...cleanings];
+  let added = 0;
+  let changed = false;
+  const propOf = (id) => properties.find((p) => p.id === id);
+  const isRotation = (r) => reservations.some((o) => o.id !== r.id && o.propertyId === r.propertyId && o.checkIn === r.checkOut);
+  for (const r of reservations) {
+    const property = propOf(r.propertyId);
+    const existing = next.find((c) => c.type === "verification" && c.sourceReservationId === r.id);
+    const wanted = !!property?.verificationEnabled && isRotation(r);
+    if (wanted && !existing) {
+      const clash = next.some((c) => c.type === "verification" && c.propertyId === r.propertyId && c.date === r.checkOut);
+      if (!clash) {
+        next.push({ id: uid(), propertyId: r.propertyId, date: r.checkOut, time: "09:00", assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: r.id, type: "verification" });
+        added++; changed = true;
+      }
+    } else if (!wanted && existing && existing.status === "a_attribuer" && !existing.assignedToId) {
+      next = next.filter((c) => c.id !== existing.id);
+      changed = true;
+    } else if (wanted && existing && existing.date !== r.checkOut && existing.status !== "termine") {
+      const clash = next.some((c) => c.id !== existing.id && c.type === "verification" && c.propertyId === r.propertyId && c.date === r.checkOut);
+      if (!clash) {
+        next = next.map((c) => (c.id === existing.id ? { ...c, date: r.checkOut } : c));
+        changed = true;
+      }
+    }
   }
+  return { next, added, changed };
+}
+// Synchronise le ménage (départ), si activée sur le logement la mission
+// d'arrivée client, et les vérifications avant rotation — à appeler après la
+// création ou la modification d'une réservation. Tout est calculé sur une
+// copie locale puis enregistré en une seule fois.
+async function syncReservationMissions(reservation, property, cleanings, saveCleanings, reservations = [], properties = []) {
+  let next = [...cleanings];
+  let changed = false;
+  const ensure = (type, date, time) => {
+    const linked = next.find((c) => c.sourceReservationId === reservation.id && (c.type || "menage") === type);
+    if (!linked) {
+      const exists = next.some((c) => c.propertyId === reservation.propertyId && c.date === date && (c.type || "menage") === type);
+      if (exists) return;
+      next.push({ id: uid(), propertyId: reservation.propertyId, date, time, assignedToId: null, status: "a_attribuer", checklistDone: {}, sourceReservationId: reservation.id, type });
+      changed = true;
+      return;
+    }
+    if (linked.date !== date || linked.propertyId !== reservation.propertyId) {
+      const clash = next.some((c) => c.id !== linked.id && c.propertyId === reservation.propertyId && c.date === date && (c.type || "menage") === type);
+      if (!clash) {
+        next = next.map((c) => (c.id === linked.id ? { ...c, date, propertyId: reservation.propertyId } : c));
+        changed = true;
+      }
+    }
+  };
+  ensure("menage", reservation.checkOut, "11:00");
+  if (property?.keyHandoverEnabled) ensure("arrivee", reservation.checkIn, "16:00");
+  const allRes = [...reservations.filter((x) => x.id !== reservation.id), reservation];
+  const allProps = properties.length ? properties : (property ? [property] : []);
+  const v = applyVerifications(allRes, allProps, next);
+  if (v.changed) { next = v.next; changed = true; }
+  if (changed) await saveCleanings(next);
 }
 async function handleReservationDeleted(reservation, cleanings, saveCleanings) {
   const linked = cleanings.filter((c) => c.sourceReservationId === reservation.id);
@@ -238,7 +296,10 @@ async function generateMissingCleanings(reservations, properties, cleanings, sav
       }
     }
   }
-  if (added > 0) await saveCleanings(next);
+  const v = applyVerifications(reservations, properties, next);
+  added += v.added;
+  const changed = added > 0 || v.changed;
+  if (changed) await saveCleanings(v.next);
   return added;
 }
 
@@ -287,7 +348,7 @@ async function syncFromICS(icsText, property, reservations, saveReservations, cl
   }
   if (created.length > 0) {
     await saveReservations(nextRes);
-    for (const r of created) await syncReservationMissions(r, property, cleanings, saveCleanings);
+    await generateMissingCleanings(nextRes.filter((r) => r.propertyId === property.id), [property], cleanings, saveCleanings);
   }
   return created.length;
 }
@@ -564,9 +625,25 @@ const GCAL_COLORS = [
   { id: "10", name: "Basilic", hex: "#0B8043" },
   { id: "11", name: "Tomate", hex: "#D50000" },
 ];
+// Les trois types de mission : "menage" (par défaut si absent), "arrivee"
+// (remise de clés) et "verification" (contrôle du logement avant rotation).
+function missionKind(c) { return c?.type || "menage"; }
+function missionLabel(c) { return { menage: "Ménage", arrivee: "Arrivée client", verification: "Vérification" }[missionKind(c)] || "Ménage"; }
+function missionDefaultTime(c) { return { menage: "11:00", arrivee: "16:00", verification: "09:00" }[missionKind(c)] || "11:00"; }
+function missionRawDuration(c, property) {
+  const k = missionKind(c);
+  return k === "arrivee" ? property?.keyHandoverDuration : k === "verification" ? property?.verificationDuration : property?.cleaningDuration;
+}
+function missionDefaultDuration(c) { return { menage: 120, arrivee: 30, verification: 30 }[missionKind(c)] || 120; }
+// Prix d'une mission : null pour un ménage (facturé autrement, via le linge etc.).
+function missionPrice(c, property) {
+  const k = missionKind(c);
+  if (k === "arrivee") return property?.keyHandoverPrice != null ? property.keyHandoverPrice : null;
+  if (k === "verification") return property?.verificationPrice != null ? property.verificationPrice : 50;
+  return null;
+}
 function cleaningSignature(c, property) {
-  const isArrival = c.type === "arrivee";
-  const duration = isArrival ? property?.keyHandoverDuration : property?.cleaningDuration;
+  const duration = missionRawDuration(c, property);
   return `${c.date}|${c.time}|${c.propertyId}|${c.status}|${c.notes || ""}|${property?.googleColorId || ""}|${duration || ""}|${c.type || "menage"}|v3`;
 }
 function cleaningEndDateTime(dateStr, timeStr, durationMinutes) {
@@ -576,13 +653,13 @@ function cleaningEndDateTime(dateStr, timeStr, durationMinutes) {
   return `${end.getFullYear()}-${pad(end.getMonth() + 1)}-${pad(end.getDate())}T${pad(end.getHours())}:${pad(end.getMinutes())}:00`;
 }
 function cleaningToEvent(cleaning, property) {
-  const isArrival = cleaning.type === "arrivee";
-  const time = cleaning.time || (isArrival ? "16:00" : "11:00");
-  const duration = (isArrival ? property?.keyHandoverDuration : property?.cleaningDuration) || (isArrival ? 30 : 120);
+  const time = cleaning.time || missionDefaultTime(cleaning);
+  const duration = missionRawDuration(cleaning, property) || missionDefaultDuration(cleaning);
+  const price = missionPrice(cleaning, property);
   return {
-    summary: `${property?.name || "Logement"} — ${isArrival ? "Arrivée client" : "Ménage"}`,
+    summary: `${property?.name || "Logement"} — ${missionLabel(cleaning)}`,
     location: property?.address || "",
-    description: `Statut : ${STATUS[cleaning.status]?.label || cleaning.status}${isArrival && property?.keyHandoverPrice != null ? `\nPrix : ${property.keyHandoverPrice} €` : ""}${cleaning.notes ? "\n" + cleaning.notes : ""}\nSynchronisé depuis Planning Ménage.`,
+    description: `Statut : ${STATUS[cleaning.status]?.label || cleaning.status}${price != null ? `\nPrix : ${price} €` : ""}${cleaning.notes ? "\n" + cleaning.notes : ""}\nSynchronisé depuis Planning Ménage.`,
     start: { dateTime: `${cleaning.date}T${time}:00`, timeZone: "Europe/Paris" },
     end: { dateTime: cleaningEndDateTime(cleaning.date, time, duration), timeZone: "Europe/Paris" },
     // La couleur choisie sur le logement s'applique par défaut ; une mission
@@ -629,6 +706,8 @@ function reportInfoRow(label, value) {
 async function generateCleaningReport(cleaning, property, person, photos) {
   const { Document, Packer, Paragraph, TextRun, HeadingLevel, Table, TableRow, TableCell, WidthType, ImageRun, AlignmentType, BorderStyle } = docx;
   const isArrival = cleaning.type === "arrivee";
+  const isVerification = cleaning.type === "verification";
+  const missionPriceValue = missionPrice(cleaning, property);
   const children = [];
 
   children.push(new Paragraph({
@@ -636,7 +715,7 @@ async function generateCleaningReport(cleaning, property, person, photos) {
     spacing: { after: 80 },
   }));
   children.push(new Paragraph({
-    children: [new TextRun({ text: isArrival ? "Arrivée client — remise de clés" : "Ménage", size: 24, color: "7C6B9C", bold: true })],
+    children: [new TextRun({ text: isArrival ? "Arrivée client — remise de clés" : isVerification ? "Vérification avant rotation" : "Ménage", size: 24, color: "7C6B9C", bold: true })],
     spacing: { after: 240 },
   }));
 
@@ -659,16 +738,16 @@ async function generateCleaningReport(cleaning, property, person, photos) {
       reportInfoRow("Adresse", property?.address),
       ...(property?.ownerName ? [reportInfoRow("Propriétaire", property.ownerName)] : []),
       ...(property?.conciergerieName ? [reportInfoRow("Conciergerie", property.conciergerieName)] : []),
-      reportInfoRow("Type de mission", isArrival ? "Arrivée client (remise de clés)" : "Ménage"),
+      reportInfoRow("Type de mission", isArrival ? "Arrivée client (remise de clés)" : isVerification ? "Vérification avant rotation" : "Ménage"),
       reportInfoRow("Date", fmtDate(cleaning.date)),
       reportInfoRow("Heure", cleaning.time),
       reportInfoRow("Statut", STATUS[cleaning.status]?.label || cleaning.status),
-      ...(isArrival && property?.keyHandoverPrice != null ? [reportInfoRow("Prix de la mission", `${property.keyHandoverPrice} €`)] : []),
+      ...(missionPriceValue != null ? [reportInfoRow("Prix de la mission", `${missionPriceValue} €`)] : []),
     ],
   }));
 
   // Checklist (ménage uniquement)
-  if (!isArrival) {
+  if (!isArrival && !isVerification) {
     const checklist = property?.checklist || [];
     const doneMap = cleaning.checklistDone || {};
     children.push(new Paragraph({ text: "Checklist réalisée", heading: HeadingLevel.HEADING_3, spacing: { before: 280, after: 100 } }));
@@ -794,7 +873,7 @@ async function generateMonthlyJournal({ monthLabel, properties, cleanings, team,
           bodyCell(fmtDate(c.date)),
           bodyCell(c.time),
           bodyCell(person?.name || "Non assigné"),
-          bodyCell(c.type === "arrivee" ? "Arrivée client (remise de clés)" : "Ménage"),
+          bodyCell(c.type === "arrivee" ? "Arrivée client (remise de clés)" : c.type === "verification" ? "Vérification avant rotation" : "Ménage"),
           bodyCell(STATUS[c.status]?.label || c.status),
         ],
       }));
@@ -915,7 +994,7 @@ function buildBackupWorkbook({ properties, cleanings, reservations, team, startI
   const missionsInRange = cleanings.filter((c) => inRange(c.date));
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(
     missionsInRange.map((c) => ({
-      Logement: propertyOf(c.propertyId)?.name || "", Type: c.type === "arrivee" ? "Arrivée client" : "Ménage",
+      Logement: propertyOf(c.propertyId)?.name || "", Type: missionLabel(c),
       Date: c.date, Heure: c.time, Statut: STATUS[c.status]?.label || c.status,
       "Assigné à": personOf(c.assignedToId)?.name || "Non assigné", Notes: c.notes || "",
     }))
@@ -941,6 +1020,13 @@ function buildBackupWorkbook({ properties, cleanings, reservations, team, startI
     return { Logement: p.name, "Arrivées terminées": list.length, "Montant (€)": list.length * (p.keyHandoverPrice || 0) };
   }).filter((x) => x["Arrivées terminées"] > 0);
   XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(arriveeByProperty), "Arrivées par logement");
+
+  const verifDoneAll = missionsInRange.filter((c) => c.type === "verification" && c.status === "termine");
+  const verifByPropertyRows = properties.filter((p) => p.verificationEnabled).map((p) => {
+    const list = verifDoneAll.filter((c) => c.propertyId === p.id);
+    return { Logement: p.name, "Vérifications terminées": list.length, "Montant (€)": list.length * (p.verificationPrice != null ? p.verificationPrice : 50) };
+  }).filter((x) => x["Vérifications terminées"] > 0);
+  XLSX.utils.book_append_sheet(wb, XLSX.utils.json_to_sheet(verifByPropertyRows), "Vérifications par logement");
 
   const laundryRows = [];
   properties.forEach((p) => {
@@ -1095,7 +1181,7 @@ async function buildMediaExportZip({ properties, cleanings, startISO, endISOExcl
     if (photos.length === 0 && videos.length === 0) continue;
 
     const property = propertyOf(c.propertyId);
-    const typeLabel = c.type === "arrivee" ? "Arrivee" : "Menage";
+    const typeLabel = c.type === "arrivee" ? "Arrivee" : c.type === "verification" ? "Verification" : "Menage";
     let folderName = sanitizeZipName(`${property?.name || "Logement"} - ${c.date} - ${typeLabel}`);
     if (usedNames[folderName] != null) {
       usedNames[folderName]++;
@@ -1646,12 +1732,19 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
           </div>
           {properties.map((p) => {
             const cleaningsForP = visibleCleanings.filter((c) => c.propertyId === p.id && c.date >= monthStartISO && c.date < nextMonthStartISO);
+            // Plusieurs missions le même jour (ex. vérification + ménage + arrivée
+            // un jour de rotation) : on les empile pour qu'aucune n'en cache une autre.
+            const KIND_ORDER = { verification: 0, menage: 1, arrivee: 2 };
+            const byDay = {};
+            cleaningsForP.forEach((c) => { (byDay[c.date] = byDay[c.date] || []).push(c); });
+            Object.values(byDay).forEach((arr) => arr.sort((a, b) => KIND_ORDER[missionKind(a)] - KIND_ORDER[missionKind(b)]));
+            const maxStack = Math.max(1, ...Object.values(byDay).map((a) => a.length));
             return (
               <div key={p.id} className="flex border-b" style={{ borderColor: C.taupeLight }}>
                 <div style={{ width: labelW, position: "sticky", left: 0, background: "#FFFDF8" }} className="shrink-0 px-2.5 py-3 flex items-center z-10">
                   <span style={{ color: C.ink }} className="text-xs font-medium truncate">{p.name}</span>
                 </div>
-                <div style={{ width: nDays * dayW, position: "relative", minHeight: 44 }}>
+                <div style={{ width: nDays * dayW, position: "relative", minHeight: Math.max(44, 12 + maxStack * 30) }}>
                   {dayCols.filter((d) => isWeekend(year, month, d)).map((d) => (
                     <div key={d} style={{ position: "absolute", left: (d - 1) * dayW, top: 0, bottom: 0, width: dayW, background: "#00000006" }} />
                   ))}
@@ -1661,11 +1754,13 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
                     const person = personOf(c.assignedToId);
                     const personColor = person?.color ? GCAL_COLORS.find((g) => g.id === person.color)?.hex : null;
                     const isArrival = c.type === "arrivee";
+                    const isVerification = c.type === "verification";
+                    const stackIdx = Math.max(0, (byDay[c.date] || []).indexOf(c));
                     return (
-                      <button key={c.id} onClick={() => onOpen(c.id)} title={`${p.name} · ${isArrival ? "Arrivée client" : "Ménage"} · ${person?.name || "Non assigné"} · ${s.label}`}
-                        className={`absolute top-2 flex items-center justify-center ${isArrival ? "rounded-full" : "rounded-md"}`}
-                        style={{ left: (day - 1) * dayW + 3, width: dayW - 6, height: 26, background: s.color, border: personColor ? `2.5px solid ${personColor}` : "2.5px solid transparent" }}>
-                        {isArrival ? <Icon name="key" size={12} color="#fff" /> : (
+                      <button key={c.id} onClick={() => onOpen(c.id)} title={`${p.name} · ${missionLabel(c)} · ${person?.name || "Non assigné"} · ${s.label}`}
+                        className={`absolute flex items-center justify-center ${isArrival ? "rounded-full" : "rounded-md"}`}
+                        style={{ top: 8 + stackIdx * 30, left: (day - 1) * dayW + 3, width: dayW - 6, height: 26, background: s.color, border: personColor ? `2.5px solid ${personColor}` : "2.5px solid transparent" }}>
+                        {isArrival ? <Icon name="key" size={12} color="#fff" /> : isVerification ? <Icon name="check" size={13} color="#fff" /> : (
                           <span className="text-[10px] font-semibold" style={{ color: "#fff" }}>{(person?.name || "?").charAt(0).toUpperCase()}</span>
                         )}
                       </button>
@@ -1689,6 +1784,9 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
         <span className="flex items-center gap-1.5 text-[11px]" style={{ color: C.taupe }}>
           <span style={{ width: 8, height: 8, borderRadius: 8, background: C.taupe, display: "inline-block" }} />Rond (🔑) = arrivée client
         </span>
+        <span className="flex items-center gap-1.5 text-[11px]" style={{ color: C.taupe }}>
+          <span style={{ width: 8, height: 8, borderRadius: 2, background: C.taupe, display: "inline-block" }} />Carré (✓) = vérification
+        </span>
       </div>
       {team.some((t) => t.color) && (
         <div className="flex gap-3 px-3 pb-2.5 flex-wrap border-t pt-2.5" style={{ borderColor: C.taupeLight }}>
@@ -1709,7 +1807,8 @@ function MenageGanttChart({ profile, team, properties, cleanings, onOpen }) {
 function DoorTagCard({ cleaning, property, person, onClick }) {
   const s = STATUS[cleaning.status] || STATUS.a_faire;
   const isArrival = cleaning.type === "arrivee";
-  const total = isArrival ? 0 : (property?.checklist?.length || 0);
+  const isVerification = cleaning.type === "verification";
+  const total = isArrival || isVerification ? 0 : (property?.checklist?.length || 0);
   const done = Object.values(cleaning.checklistDone || {}).filter(Boolean).length;
   return (
     <button onClick={onClick} className="relative w-full text-left rounded-2xl overflow-hidden border" style={{ borderColor: C.taupeLight, background: "#FFFDF8" }}>
@@ -1720,13 +1819,15 @@ function DoorTagCard({ cleaning, property, person, onClick }) {
           <div className="flex items-center justify-between">
             <h3 style={{ fontFamily: "'Space Grotesk', sans-serif", color: C.ink }} className="font-semibold text-[15px] flex items-center gap-1.5">
               {isArrival && <Icon name="key" size={13} color={C.violet} />}
+              {isVerification && <Icon name="check" size={13} color={C.violet} />}
               {property?.name || "Logement supprimé"}
             </h3>
             <span className="text-[11px] font-semibold px-2 py-0.5 rounded-full" style={{ background: s.bg, color: s.color }}>{s.label}</span>
           </div>
           {isArrival && <p style={{ color: C.violet }} className="text-[10.5px] mt-0.5 font-medium">Arrivée client — remise de clés</p>}
+          {isVerification && <p style={{ color: C.violet }} className="text-[10.5px] mt-0.5 font-medium">Vérification avant rotation</p>}
           {cleaning.sourceReservationId && (
-            <p style={{ color: C.taupe }} className="text-[10.5px] mt-0.5">Généré automatiquement · {isArrival ? "arrivée client" : "départ client"}</p>
+            <p style={{ color: C.taupe }} className="text-[10.5px] mt-0.5">Généré automatiquement · {isArrival ? "arrivée client" : isVerification ? "rotation du jour" : "départ client"}</p>
           )}
           <div style={{ color: C.taupe }} className="flex items-center gap-3 text-xs mt-1.5">
             <span className="flex items-center gap-1"><Icon name="calendar" size={12} /> {fmtDate(cleaning.date)}</span>
@@ -1761,21 +1862,25 @@ function NewCleaningForm({ properties, team, onClose, onCreate, initial }) {
     onCreate(data);
   };
   return (
-    <Sheet onClose={onClose} title={initial ? `Modifier ${type === "arrivee" ? "l'arrivée" : "le ménage"}` : "Nouvelle mission"}>
+    <Sheet onClose={onClose} title={initial ? `Modifier ${type === "arrivee" ? "l'arrivée" : type === "verification" ? "la vérification" : "le ménage"}` : "Nouvelle mission"}>
       {properties.length === 0 ? (
         <EmptyState icon="home" text="Ajoute d'abord un logement dans l'onglet Logements." />
       ) : (
         <div className="flex flex-col gap-4">
           {!initial && (
             <Field label="Type de mission">
-              <div className="grid grid-cols-2 gap-3">
-                <button onClick={() => setType("menage")} className="rounded-xl py-2.5 text-sm font-medium border transition"
+              <div className="grid grid-cols-3 gap-2">
+                <button onClick={() => { setType("menage"); setTime("11:00"); }} className="rounded-xl py-2.5 text-sm font-medium border transition"
                   style={{ background: type === "menage" ? C.ink : "transparent", color: type === "menage" ? "#fff" : C.taupe, borderColor: C.ink }}>
                   Ménage
                 </button>
-                <button onClick={() => setType("arrivee")} className="rounded-xl py-2.5 text-sm font-medium border transition flex items-center justify-center gap-1.5"
+                <button onClick={() => { setType("arrivee"); setTime("16:00"); }} className="rounded-xl py-2.5 text-sm font-medium border transition flex items-center justify-center gap-1.5"
                   style={{ background: type === "arrivee" ? C.violet : "transparent", color: type === "arrivee" ? "#fff" : C.violet, borderColor: C.violet }}>
-                  <Icon name="key" size={13} /> Arrivée client
+                  <Icon name="key" size={13} /> Arrivée
+                </button>
+                <button onClick={() => { setType("verification"); setTime("09:00"); }} className="rounded-xl py-2.5 text-sm font-medium border transition flex items-center justify-center gap-1.5"
+                  style={{ background: type === "verification" ? C.violet : "transparent", color: type === "verification" ? "#fff" : C.violet, borderColor: C.violet }}>
+                  <Icon name="check" size={13} /> Vérif.
                 </button>
               </div>
             </Field>
@@ -1844,6 +1949,8 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const toggleItem = (itemId) => onUpdate({ checklistDone: { ...doneMap, [itemId]: !doneMap[itemId] } });
   const setStatus = (status) => onUpdate({ status });
   const isArrival = cleaning.type === "arrivee";
+  const isVerification = cleaning.type === "verification";
+  const missionPriceValue = missionPrice(cleaning, property);
 
   if (editing) {
     return (
@@ -1907,7 +2014,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const saveIssue = () => onUpdate({ issue });
 
   return (
-    <Sheet onClose={onClose} title={`${isArrival ? "Arrivée client" : "Ménage"}${property?.name ? " — " + property.name : ""}`}>
+    <Sheet onClose={onClose} title={`${missionLabel(cleaning)}${property?.name ? " — " + property.name : ""}`}>
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Notes</p>
       <textarea value={notes} onChange={(e) => setNotes(e.target.value)} onBlur={saveNotes} placeholder="Ex. clé sous le pot, interphone en panne…" rows={3}
         className="w-full px-3 py-2 rounded-xl text-sm outline-none mb-5" style={{ background: C.linenSoft, color: C.ink }} />
@@ -1916,8 +2023,8 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
         <span className="flex items-center gap-1"><Icon name="clock" size={14} />{cleaning.time}</span>
       </div>
       {property?.address && <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-4"><Icon name="mapPin" size={14} /> {property.address}</p>}
-      {isArrival && property?.keyHandoverPrice != null && (
-        <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-4"><Icon name="key" size={14} /> Prix de cette mission : {property.keyHandoverPrice} €</p>
+      {(isArrival || isVerification) && missionPriceValue != null && (
+        <p style={{ color: C.taupe }} className="flex items-center gap-1 text-sm mb-4"><Icon name={isArrival ? "key" : "check"} size={14} /> Prix de cette mission : {missionPriceValue} €</p>
       )}
       <div className="flex gap-2 mb-5">
         {Object.entries(STATUS).map(([key, s]) => (
@@ -1933,7 +2040,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
           </p>
         </div>
       )}
-      {!isArrival && property && (
+      {!isArrival && !isVerification && property && (
         <div className="mb-5">
           <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Linge de ce logement</p>
           <div className="flex gap-2">
@@ -1973,6 +2080,8 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
 
       {!isArrival && (
         <>
+          {!isVerification && (
+            <>
           <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Checklist ({doneCount}/{checklist.length})</p>
           <div className="flex flex-col gap-2 mb-5">
             {checklist.length === 0 && <p style={{ color: C.taupe }} className="text-sm">Ce logement n'a pas encore de checklist.</p>}
@@ -1988,6 +2097,8 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
               );
             })}
           </div>
+            </>
+          )}
           <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Photos</p>
           <div className="flex flex-wrap gap-2 mb-2">
             {loadingPhotos ? <div className="animate-spin"><Icon name="loader" size={18} color={C.taupe} /></div> : photos.map((src, i) => (
@@ -2079,10 +2190,10 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
       {profile.role === "owner" && (
         <div className="flex flex-col gap-2">
           <button onClick={() => setEditing(true)} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: C.linenSoft, color: C.ink }}>
-            <Icon name="pencil" size={15} /> Modifier {isArrival ? "cette arrivée" : "ce ménage"}
+            <Icon name="pencil" size={15} /> Modifier {isArrival ? "cette arrivée" : isVerification ? "cette vérification" : "ce ménage"}
           </button>
           <button onClick={onDelete} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 text-sm" style={{ background: "#F3DCCF", color: C.terracotta }}>
-            <Icon name="trash" size={15} /> Supprimer {isArrival ? "cette arrivée" : "ce ménage"}
+            <Icon name="trash" size={15} /> Supprimer {isArrival ? "cette arrivée" : isVerification ? "cette vérification" : "ce ménage"}
           </button>
         </div>
       )}
@@ -2381,7 +2492,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
             if (duplicate) { setShowForm(false); return; }
             const newRes = { id: uid(), ...data };
             await saveReservations([...reservations, newRes]);
-            await syncReservationMissions(newRes, properties.find((p) => p.id === newRes.propertyId), cleanings, saveCleanings);
+            await syncReservationMissions(newRes, properties.find((p) => p.id === newRes.propertyId), cleanings, saveCleanings, reservations, properties);
             setShowForm(false);
           }} />
       )}
@@ -2391,7 +2502,7 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
           onUpdate={async (patch) => {
             const updated = { ...openReservation, ...patch };
             await saveReservations(reservations.map((r) => (r.id === openReservation.id ? updated : r)));
-            await syncReservationMissions(updated, properties.find((p) => p.id === updated.propertyId), cleanings, saveCleanings);
+            await syncReservationMissions(updated, properties.find((p) => p.id === updated.propertyId), cleanings, saveCleanings, reservations, properties);
           }}
           onDelete={async () => {
             await handleReservationDeleted(openReservation, cleanings, saveCleanings);
@@ -2673,6 +2784,9 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const [cleaningDuration, setCleaningDuration] = useState(property.cleaningDuration != null ? String(property.cleaningDuration) : "120");
   const [keyHandoverPrice, setKeyHandoverPrice] = useState(property.keyHandoverPrice != null ? String(property.keyHandoverPrice) : "");
   const [keyHandoverDuration, setKeyHandoverDuration] = useState(property.keyHandoverDuration != null ? String(property.keyHandoverDuration) : "30");
+  const [verificationPrice, setVerificationPrice] = useState(property.verificationPrice != null ? String(property.verificationPrice) : "50");
+  const [verificationDuration, setVerificationDuration] = useState(property.verificationDuration != null ? String(property.verificationDuration) : "30");
+  const [hostawayListingId, setHostawayListingId] = useState(property.hostawayListingId || "");
   const [icalUrl, setIcalUrl] = useState(property.icalUrl || "");
   const [icsPaste, setIcsPaste] = useState("");
   const [syncing, setSyncing] = useState(false);
@@ -2689,6 +2803,10 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
   const saveDefaultCleaningPrice = () => onUpdate({ defaultCleaningPrice: defaultCleaningPrice.trim() === "" ? null : Number(defaultCleaningPrice) });
   const saveCleaningDuration = () => onUpdate({ cleaningDuration: Math.max(15, Number(cleaningDuration) || 120) });
   const toggleKeyHandover = () => onUpdate({ keyHandoverEnabled: !property.keyHandoverEnabled });
+  const toggleVerification = () => onUpdate({ verificationEnabled: !property.verificationEnabled, ...(property.verificationPrice == null ? { verificationPrice: 50 } : {}), ...(property.verificationDuration == null ? { verificationDuration: 30 } : {}) });
+  const saveVerificationPrice = () => onUpdate({ verificationPrice: Math.max(0, Number(verificationPrice) || 0) });
+  const saveVerificationDuration = () => onUpdate({ verificationDuration: Math.max(5, Number(verificationDuration) || 30) });
+  const saveHostawayListingId = () => onUpdate({ hostawayListingId: hostawayListingId.replace(/\D/g, "") });
   const saveKeyHandoverPrice = () => onUpdate({ keyHandoverPrice: Number(keyHandoverPrice) || 0 });
   const saveKeyHandoverDuration = () => onUpdate({ keyHandoverDuration: Math.max(5, Number(keyHandoverDuration) || 30) });
   const saveIcalUrl = () => onUpdate({ icalUrl: icalUrl.trim() });
@@ -2854,6 +2972,41 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
               </p>
             </div>
           )}
+        </div>
+      )}
+
+      {isOwner && (
+        <div className="mb-5">
+          <button onClick={toggleVerification} className="flex items-center gap-3 w-full text-left mb-3">
+            <span className="flex items-center justify-center rounded-md shrink-0" style={{ width: 22, height: 22, background: property.verificationEnabled ? C.sauge : "#fff", border: `1px solid ${property.verificationEnabled ? C.sauge : C.taupeLight}` }}>
+              {property.verificationEnabled && <Icon name="check" size={14} color="#fff" />}
+            </span>
+            <span style={{ color: C.ink }} className="text-sm font-semibold">Vérification du logement avant chaque rotation</span>
+          </button>
+          {property.verificationEnabled && (
+            <div className="pl-8 flex flex-col gap-3">
+              <Field label="Prix de la vérification (€)">
+                <input type="number" min="0" step="1" value={verificationPrice} onChange={(e) => setVerificationPrice(e.target.value)} onBlur={saveVerificationPrice} placeholder="Ex. 50" style={selectStyle} />
+              </Field>
+              <Field label="Durée moyenne d'une vérification (minutes)">
+                <input type="number" min="5" step="5" value={verificationDuration} onChange={(e) => setVerificationDuration(e.target.value)} onBlur={saveVerificationDuration} placeholder="Ex. 30" style={selectStyle} />
+              </Field>
+              <p style={{ color: C.taupe }} className="text-xs">
+                Une mission "Vérification" (50 € par défaut) est créée automatiquement le matin de chaque rotation, c'est-à-dire un jour où un client part et un autre arrive, avant le ménage. Elle apparaît dans le planning Ménage et se gère comme les autres missions, avec photos et notes.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {isOwner && (
+        <div className="mb-5">
+          <Field label="Identifiant du logement dans Hostaway">
+            <input inputMode="numeric" value={hostawayListingId} onChange={(e) => setHostawayListingId(e.target.value)} onBlur={saveHostawayListingId} placeholder="Ex. 407342" style={selectStyle} />
+          </Field>
+          <p style={{ color: C.taupe }} className="text-xs mt-1.5">
+            Le numéro entre parenthèses à la fin du nom du logement dans les tâches Hostaway. Il sert à retrouver la bonne tâche quand le statut est synchronisé avec Hostaway.
+          </p>
         </div>
       )}
 
@@ -3332,6 +3485,20 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
   }).filter((x) => x.count > 0).sort((a, b) => b.count - a.count);
   const totalArriveeAmount = arriveeByPerson.reduce((s, x) => s + x.amount, 0);
 
+  // Missions "Vérification" (avant rotation) — mêmes indicateurs, 50 € par défaut.
+  const verifDone = cleaningsThisMonth.filter((c) => c.type === "verification" && c.status === "termine");
+  const verifPriceOf = (id) => { const pr = properties.find((p) => p.id === id); return pr?.verificationPrice != null ? pr.verificationPrice : 50; };
+  const verifDurationOf = (id) => properties.find((p) => p.id === id)?.verificationDuration || 30;
+  const verifByPerson = team.map((t) => {
+    const list = verifDone.filter((c) => c.assignedToId === t.id);
+    return { person: t, count: list.length, minutes: list.reduce((s, c) => s + verifDurationOf(c.propertyId), 0), amount: list.reduce((s, c) => s + verifPriceOf(c.propertyId), 0) };
+  }).filter((x) => x.count > 0).sort((a, b) => b.count - a.count);
+  const verifByProperty = properties.filter((p) => p.verificationEnabled).map((p) => {
+    const list = verifDone.filter((c) => c.propertyId === p.id);
+    return { property: p, count: list.length, minutes: list.length * verifDurationOf(p.id), amount: list.length * verifPriceOf(p.id) };
+  }).filter((x) => x.count > 0).sort((a, b) => b.count - a.count);
+  const totalVerifAmount = verifByPerson.reduce((s, x) => s + x.amount, 0);
+
   const late = cleanings.filter((c) => c.date < todayISO() && c.status !== "termine").sort((a, b) => a.date.localeCompare(b.date));
 
   const revenueByProperty = properties.map((p) => {
@@ -3467,6 +3634,23 @@ function StatsTab({ properties, cleanings, reservations, team, profile, saveClea
                   <p style={{ color: C.taupe }} className="text-xs py-2">Aucune arrivée terminée ce mois-ci.</p>
                 ) : arriveeByProperty.map((x, i) => (
                   <StatRow key={x.property.id} left={x.property.name} right={`${x.count} · ${x.amount.toFixed(0)} €`} last={i === arriveeByProperty.length - 1} />
+                ))}
+              </StatSection>
+            </>
+          )}
+
+          {(verifByPerson.length > 0 || verifByProperty.length > 0) && (
+            <>
+              <StatSection title="Vérifications avant rotation par personne ce mois-ci">
+                {verifByPerson.map((x) => (
+                  <StatRow key={x.person.id} left={x.person.name} right={`${x.count} · ${formatDuration(x.minutes)} · ${x.amount.toFixed(0)} €`} />
+                ))}
+                <StatRow left="Total à verser/facturer" right={`${totalVerifAmount.toFixed(0)} €`} color={C.violet} last />
+              </StatSection>
+
+              <StatSection title="Vérifications par logement ce mois-ci">
+                {verifByProperty.map((x, i) => (
+                  <StatRow key={x.property.id} left={x.property.name} right={`${x.count} · ${x.amount.toFixed(0)} €`} last={i === verifByProperty.length - 1} />
                 ))}
               </StatSection>
             </>
