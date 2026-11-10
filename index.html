@@ -561,12 +561,29 @@ function gcalLedger(profileId) {
 function gcalSaveLedger(profileId, ledger) {
   localStorage.setItem(`gcal-ledger:${profileId}`, JSON.stringify(ledger));
 }
-function gcalTokenClient(callback) {
-  return google.accounts.oauth2.initTokenClient({ client_id: window.__GOOGLE_CLIENT_ID__, scope: GCAL_SCOPE, callback });
+function gcalTokenClient(callback, errorCallback) {
+  return google.accounts.oauth2.initTokenClient({ client_id: window.__GOOGLE_CLIENT_ID__, scope: GCAL_SCOPE, callback, error_callback: errorCallback });
+}
+// Sur téléphone, le script Google peut mettre un moment à se charger : on
+// l'attend (jusqu'à 8 s) au lieu de conclure tout de suite que ce n'est pas configuré.
+async function gcalWaitReady() {
+  for (let i = 0; i < 40; i++) {
+    if (gcalConfigured()) return true;
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  return !!gcalConfigured();
 }
 function gcalConnect(profileId, hintEmail) {
+  // Chemin direct (sans attente) quand Google est déjà chargé : la fenêtre
+  // de connexion doit s'ouvrir dans le clic, sinon le téléphone la bloque.
+  if (gcalConfigured()) return gcalConnectNow(profileId, hintEmail);
+  return gcalWaitReady().then((ok) => {
+    if (!ok) throw new Error("not-configured");
+    return gcalConnectNow(profileId, hintEmail);
+  });
+}
+function gcalConnectNow(profileId, hintEmail) {
   return new Promise((resolve, reject) => {
-    if (!gcalConfigured()) { reject(new Error("not-configured")); return; }
     try {
       const client = gcalTokenClient((resp) => {
         if (resp.error) { reject(resp); return; }
@@ -574,7 +591,7 @@ function gcalConnect(profileId, hintEmail) {
         localStorage.setItem(`gcal-connected:${profileId}`, "1");
         localStorage.setItem(`gcal-email:${profileId}`, hintEmail || "");
         resolve(resp.access_token);
-      });
+      }, (err) => reject(new Error(err?.type === "popup_failed_to_open" ? "popup-blocked" : "popup-closed")));
       // "hint" pré-sélectionne le bon compte dans la fenêtre Google.
       const opts = { prompt: "consent" };
       if (hintEmail) opts.hint = hintEmail;
@@ -583,23 +600,32 @@ function gcalConnect(profileId, hintEmail) {
   });
 }
 function gcalGetToken(profileId) {
-  return new Promise((resolve) => {
-    const raw = localStorage.getItem(`gcal-token:${profileId}`);
-    if (raw) {
+  const raw = localStorage.getItem(`gcal-token:${profileId}`);
+  if (raw) {
+    try {
       const cached = JSON.parse(raw);
-      if (cached.expiresAt > Date.now()) { resolve(cached.token); return; }
-    }
-    if (!gcalIsConnected(profileId) || !gcalConfigured()) { resolve(null); return; }
-    // Jeton expiré : ré-autorisation silencieuse (déjà accordée précédemment).
+      if (cached.expiresAt > Date.now()) return Promise.resolve(cached.token);
+    } catch (e) {}
+  }
+  if (!gcalIsConnected(profileId) || !gcalConfigured()) return Promise.resolve(null);
+  // Jeton expiré (ils durent 1 h) : ré-autorisation silencieuse, déjà accordée
+  // précédemment. IMPORTANT : cette fonction doit être appelée directement
+  // dans le clic du bouton, sans attente avant, sinon le téléphone bloque la
+  // fenêtre Google. Si la fenêtre est bloquée, fermée ou ne répond pas, on rend
+  // null au lieu d'attendre indéfiniment.
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => finish(null), 25000);
     try {
       const client = gcalTokenClient((resp) => {
-        if (resp.error) { resolve(null); return; }
+        if (resp.error) { finish(null); return; }
         localStorage.setItem(`gcal-token:${profileId}`, JSON.stringify({ token: resp.access_token, expiresAt: Date.now() + (resp.expires_in - 60) * 1000 }));
-        resolve(resp.access_token);
-      });
+        finish(resp.access_token);
+      }, () => finish(null));
       const hint = gcalConnectedEmail(profileId);
       client.requestAccessToken(hint ? { prompt: "", hint } : { prompt: "" });
-    } catch (e) { resolve(null); }
+    } catch (e) { finish(null); }
   });
 }
 async function gcalApi(method, path, token, body) {
@@ -607,7 +633,7 @@ async function gcalApi(method, path, token, body) {
     method, headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined,
   });
   if (method === "DELETE") { if (!res.ok && res.status !== 410 && res.status !== 404) throw new Error("gcal delete failed"); return null; }
-  if (!res.ok) throw new Error("gcal api failed: " + res.status);
+  if (!res.ok) { const err = new Error("gcal api failed: " + res.status); err.status = res.status; throw err; }
   return res.json();
 }
 // Palette officielle des couleurs d'événement Google Agenda (fixe, ce sont
@@ -662,6 +688,9 @@ function cleaningToEvent(cleaning, property) {
     description: `Statut : ${STATUS[cleaning.status]?.label || cleaning.status}${price != null ? `\nPrix : ${price} €` : ""}${cleaning.notes ? "\n" + cleaning.notes : ""}\nSynchronisé depuis Planning Ménage.`,
     start: { dateTime: `${cleaning.date}T${time}:00`, timeZone: "Europe/Paris" },
     end: { dateTime: cleaningEndDateTime(cleaning.date, time, duration), timeZone: "Europe/Paris" },
+    // Étiquette invisible : permet de retrouver l'événement depuis un autre
+    // appareil (téléphone / ordinateur) sans créer de doublon.
+    extendedProperties: { private: { pmApp: "planning-menage", pmCleaningId: cleaning.id } },
     // La couleur choisie sur le logement s'applique par défaut ; une mission
     // "à attribuer" reste signalée en violet (Raisin) quoi qu'il arrive, pour
     // ne jamais perdre ce repère d'urgence.
@@ -1213,24 +1242,69 @@ async function buildMediaExportZip({ properties, cleanings, startISO, endISOExcl
 // vers son Google Agenda personnel. Crée / met à jour / retire les
 // événements en fonction des changements depuis le dernier passage.
 async function syncMyCleanings(profile, cleanings, properties) {
+  // Premier appel de la fonction = dans le clic du bouton (voir gcalGetToken).
   const token = await gcalGetToken(profile.id);
-  if (!token) throw new Error("not-connected");
+  if (!token) throw new Error(gcalIsConnected(profile.id) ? "token-refresh-failed" : "not-connected");
   const ledger = gcalLedger(profile.id);
   const mine = cleanings.filter((c) => c.assignedToId === profile.id);
   let created = 0, updated = 0, removed = 0;
+
+  // Les carnets de correspondance sont propres à chaque appareil : si ce
+  // téléphone (ou cet ordinateur) n'a pas encore vu certains ménages, on
+  // cherche d'abord s'ils sont déjà dans l'agenda avant d'en créer (sinon
+  // doublons). On retrouve un événement par son étiquette, ou à défaut par
+  // son titre et son heure de début.
+  const missing = mine.filter((c) => !ledger[c.id]);
+  let existingByTag = new Map(), existingBySlot = new Map();
+  if (missing.length > 0) {
+    const dates = missing.map((c) => c.date).sort();
+    const dayBefore = new Date(parseISO(dates[0]).getTime() - 86400000).toISOString();
+    const dayAfter = new Date(parseISO(dates[dates.length - 1]).getTime() + 2 * 86400000).toISOString();
+    let pageToken = "";
+    for (let page = 0; page < 6; page++) {
+      const q = `/calendars/primary/events?timeMin=${encodeURIComponent(dayBefore)}&timeMax=${encodeURIComponent(dayAfter)}&singleEvents=true&showDeleted=false&maxResults=2500${pageToken ? `&pageToken=${encodeURIComponent(pageToken)}` : ""}`;
+      const json = await gcalApi("GET", q, token);
+      for (const ev of json.items || []) {
+        const tag = ev.extendedProperties?.private?.pmCleaningId;
+        if (tag) existingByTag.set(tag, ev.id);
+        if (ev.summary && ev.start?.dateTime) existingBySlot.set(`${ev.summary}|${ev.start.dateTime.slice(0, 16)}`, ev.id);
+      }
+      pageToken = json.nextPageToken || "";
+      if (!pageToken) break;
+    }
+  }
 
   for (const c of mine) {
     const property = properties.find((p) => p.id === c.propertyId);
     const sig = cleaningSignature(c, property);
     const entry = ledger[c.id];
     if (!entry) {
-      const ev = await gcalApi("POST", "/calendars/primary/events", token, cleaningToEvent(c, property));
-      ledger[c.id] = { eventId: ev.id, sig };
-      created++;
+      const body = cleaningToEvent(c, property);
+      const found = existingByTag.get(c.id) || existingBySlot.get(`${body.summary}|${body.start.dateTime.slice(0, 16)}`);
+      if (found) {
+        // Déjà présent dans l'agenda (créé depuis un autre appareil) : on le reprend.
+        await gcalApi("PATCH", `/calendars/primary/events/${found}`, token, body);
+        ledger[c.id] = { eventId: found, sig };
+        updated++;
+      } else {
+        const ev = await gcalApi("POST", "/calendars/primary/events", token, body);
+        ledger[c.id] = { eventId: ev.id, sig };
+        created++;
+      }
     } else if (entry.sig !== sig) {
-      await gcalApi("PATCH", `/calendars/primary/events/${entry.eventId}`, token, cleaningToEvent(c, property));
-      ledger[c.id] = { eventId: entry.eventId, sig };
-      updated++;
+      try {
+        await gcalApi("PATCH", `/calendars/primary/events/${entry.eventId}`, token, cleaningToEvent(c, property));
+        ledger[c.id] = { eventId: entry.eventId, sig };
+        updated++;
+      } catch (e) {
+        // L'événement a été supprimé à la main dans Google Agenda : on le recrée
+        // au lieu de bloquer toute la synchronisation.
+        if (e.status === 404 || e.status === 410) {
+          const ev = await gcalApi("POST", "/calendars/primary/events", token, cleaningToEvent(c, property));
+          ledger[c.id] = { eventId: ev.id, sig };
+          created++;
+        } else throw e;
+      }
     }
   }
   const mineIds = new Set(mine.map((c) => c.id));
@@ -1497,18 +1571,44 @@ function GoogleAgendaPanel({ profile, team, cleanings, properties, onClose }) {
       const res = await syncMyCleanings(profile, cleanings, properties);
       setMsg(`Connecté ! ${res.created} événement${res.created > 1 ? "s" : ""} créé${res.created > 1 ? "s" : ""}.`);
     } catch (e) {
-      if (e?.message === "not-configured") setMsg("La connexion Google Agenda n'est pas encore configurée pour cette appli — voir README.md.");
+      if (e?.message === "not-configured") setMsg("Google n'a pas fini de se charger ou n'est pas configuré. Attends quelques secondes et réessaie ; vérifie ta connexion internet.");
+      else if (e?.message === "popup-blocked") setMsg("Ton téléphone a bloqué la fenêtre Google. Autorise les pop-up pour ce site, ou ouvre l'appli dans Chrome/Safari plutôt que depuis l'icône de l'écran d'accueil, puis réessaie.");
       else setMsg("La connexion a échoué ou a été annulée. Si Google affiche « accès bloqué », l'adresse doit d'abord être ajoutée comme utilisateur test dans Google Cloud.");
     }
     setBusy(false);
   };
+  const [needReconnect, setNeedReconnect] = useState(false);
   const doSync = async () => {
-    setBusy(true); setMsg("");
+    setBusy(true); setMsg(""); setNeedReconnect(false);
     try {
       const res = await syncMyCleanings(profile, cleanings, properties);
       setMsg(`Synchronisé : ${res.created} créé${res.created > 1 ? "s" : ""}, ${res.updated} mis à jour, ${res.removed} retiré${res.removed > 1 ? "s" : ""}.`);
     } catch (e) {
-      setMsg("La synchronisation a échoué. Réessaie, ou reconnecte ton agenda si le problème persiste.");
+      if (e?.message === "token-refresh-failed" || e?.status === 401) {
+        setNeedReconnect(true);
+        setMsg("Google n'a pas pu renouveler l'accès (il expire toutes les heures) : la fenêtre de connexion n'a pas pu s'ouvrir. Appuie sur « Reconnecter » puis réessaie. Sur téléphone, autorise les fenêtres pop-up pour ce site et ouvre l'appli dans Chrome ou Safari plutôt que depuis l'icône de l'écran d'accueil.");
+      } else if (e?.status === 403) {
+        setMsg("Google refuse l'accès à l'agenda (erreur 403). Vérifie que ton adresse est bien ajoutée comme utilisateur test dans Google Cloud, puis reconnecte-toi.");
+      } else {
+        setMsg(`La synchronisation a échoué${e?.status ? ` (erreur ${e.status})` : ""}. Réessaie, ou appuie sur « Reconnecter ».`);
+        setNeedReconnect(true);
+      }
+    }
+    setBusy(false);
+  };
+  // Renouvelle seulement l'accès (sans effacer le carnet des événements déjà créés).
+  const doReconnect = async () => {
+    setBusy(true); setMsg("");
+    try {
+      await gcalConnect(profile.id, activeEmail || connectedEmail);
+      setConnected(true);
+      setNeedReconnect(false);
+      const res = await syncMyCleanings(profile, cleanings, properties);
+      setMsg(`Reconnecté et synchronisé : ${res.created} créé${res.created > 1 ? "s" : ""}, ${res.updated} mis à jour, ${res.removed} retiré${res.removed > 1 ? "s" : ""}.`);
+    } catch (e) {
+      setMsg(e?.message === "popup-blocked"
+        ? "Ton téléphone a bloqué la fenêtre Google. Autorise les pop-up pour ce site (réglages du navigateur), ou ouvre l'appli dans Chrome/Safari, puis réessaie."
+        : "La reconnexion a échoué ou a été annulée. Réessaie.");
     }
     setBusy(false);
   };
@@ -1585,6 +1685,12 @@ function GoogleAgendaPanel({ profile, team, cleanings, properties, onClose }) {
             {busy ? <div className="animate-spin"><Icon name="loader" size={16} /></div> : <Icon name="calendar" size={16} />}
             Synchroniser maintenant
           </button>
+          {needReconnect && (
+            <button onClick={doReconnect} disabled={busy} className="w-full py-3 rounded-xl font-medium flex items-center justify-center gap-2 disabled:opacity-50" style={{ background: C.or, color: "#fff" }}>
+              <Icon name="calendar" size={16} />
+              Reconnecter
+            </button>
+          )}
           <button onClick={doDisconnect} disabled={busy} className="w-full py-2.5 rounded-xl text-sm font-medium disabled:opacity-50" style={{ background: C.linenSoft, color: C.taupe }}>
             Déconnecter
           </button>
