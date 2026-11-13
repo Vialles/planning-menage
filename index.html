@@ -499,24 +499,25 @@ function ensureDocxLoaded() {
 // Partage les photos d'un ménage via le menu de partage natif du téléphone
 // (WhatsApp, Messages, email...). Repose sur la Web Share API — disponible
 // sur la plupart des navigateurs mobiles, pas forcément sur ordinateur.
-async function shareCleaningPhotos(photos, property) {
-  if (!photos || photos.length === 0) return { ok: false, reason: "no-photos" };
+// IMPORTANT : sur téléphone, le menu de partage doit être ouvert directement
+// dans le clic. On convertit donc les photos en fichiers sans aucune attente
+// (pas de fetch), puis on appelle navigator.share tout de suite. Avant, une
+// attente se glissait entre le clic et le partage et le téléphone refusait.
+function shareCleaningPhotos(photos, property) {
+  if (!photos || photos.length === 0) return Promise.resolve({ ok: false, reason: "no-photos" });
+  let files;
   try {
-    const files = await Promise.all(photos.map(async (src, i) => {
-      const res = await fetch(src);
-      const blob = await res.blob();
-      const filename = `menage-${property?.name || "logement"}-${i + 1}.jpg`.replace(/\s+/g, "-");
-      return new File([blob], filename, { type: "image/jpeg" });
-    }));
-    if (navigator.canShare && navigator.canShare({ files })) {
-      await navigator.share({ files, title: `Photos — ${property?.name || "logement"}`, text: `Photos du ménage — ${property?.name || "logement"}` });
-      return { ok: true };
-    }
-    return { ok: false, reason: "not-supported" };
+    files = photos.map((src, i) => new File([dataURLtoBlob(src)], `menage-${property?.name || "logement"}-${i + 1}.jpg`.replace(/\s+/g, "-"), { type: "image/jpeg" }));
   } catch (e) {
-    if (e?.name === "AbortError") return { ok: false, reason: "cancelled" };
-    return { ok: false, reason: "error" };
+    return Promise.resolve({ ok: false, reason: "error", detail: e?.name || "" });
   }
+  if (!navigator.share || !navigator.canShare || !navigator.canShare({ files })) {
+    return Promise.resolve({ ok: false, reason: "not-supported" });
+  }
+  return navigator
+    .share({ files, title: `Photos — ${property?.name || "logement"}`, text: `Photos du ménage — ${property?.name || "logement"}` })
+    .then(() => ({ ok: true }))
+    .catch((e) => (e?.name === "AbortError" ? { ok: false, reason: "cancelled" } : { ok: false, reason: "error", detail: e?.name || "" }));
 }
 
 /* ---------------------------------------------------------
@@ -2233,7 +2234,7 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
                   const res = await shareCleaningPhotos(photos, property);
                   if (res.ok) setShareMsg("");
                   else if (res.reason === "not-supported") setShareMsg("Le partage direct n'est pas disponible sur ce navigateur. Appuie longuement sur une photo pour l'enregistrer, puis partage-la manuellement.");
-                  else if (res.reason === "error") setShareMsg("Le partage a échoué. Réessaie.");
+                  else if (res.reason === "error") setShareMsg(`Le partage a échoué${res.detail ? ` (${res.detail})` : ""}. Réessaie ; avec beaucoup de photos, essaie d'en partager moins à la fois, ou utilise Statistiques → Exporter photos & vidéos.`);
                   setSharing(false);
                 }}
                 disabled={sharing}
@@ -2999,6 +3000,29 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
         </p>
       )}
 
+      {isOwner && (
+        <div className="mb-5">
+          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Synchronisation réservations (Hostaway / iCal)</p>
+          <div className="flex gap-2 mb-2">
+            <input value={icalUrl} onChange={(e) => setIcalUrl(e.target.value)} onBlur={saveIcalUrl} placeholder="Lien iCal Hostaway (optionnel)" className="flex-1" style={selectStyle} />
+          </div>
+          <button onClick={runSync} disabled={!icalUrl.trim() || syncing} className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: C.linenSoft, color: C.ink }}>
+            {syncing ? <div className="animate-spin"><Icon name="loader" size={14} color={C.taupe} /></div> : <Icon name="calendar" size={14} color={C.taupe} />}
+            Synchroniser maintenant
+          </button>
+          <details className="mb-1">
+            <summary style={{ color: C.taupe }} className="text-xs cursor-pointer select-none">La synchronisation automatique ne fonctionne pas ? Coller le calendrier manuellement</summary>
+            <textarea value={icsPaste} onChange={(e) => setIcsPaste(e.target.value)} placeholder="Colle ici le contenu du fichier .ics (BEGIN:VCALENDAR...)" rows={3}
+              className="w-full px-3 py-2 rounded-xl text-xs outline-none mt-2 mb-2" style={{ background: C.linenSoft, color: C.ink, fontFamily: "'IBM Plex Mono', monospace" }} />
+            <button onClick={runPasteImport} disabled={!icsPaste.trim() || syncing} className="w-full py-2 rounded-xl text-xs font-medium disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
+              Importer ce texte
+            </button>
+          </details>
+          {syncMsg && <p style={{ color: C.sauge }} className="text-xs mt-2">{syncMsg}</p>}
+          <p style={{ color: C.taupe }} className="text-xs mt-2">Import des dates uniquement (pas le nom ni le téléphone du client) — à compléter à la main dans la fiche de chaque réservation si besoin.</p>
+        </div>
+      )}
+
       <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Stock de linge</p>
       <div className="rounded-xl px-3 py-1 mb-3" style={{ background: C.linenSoft }}>
         <Stepper label="Propre" value={stock.clean || 0} onChange={(v) => updateStock({ clean: v })} color={C.sauge} readOnly={!isOwner} />
@@ -3150,29 +3174,6 @@ function PropertyDetail({ property, profile, cleanings, saveCleanings, reservati
           <p style={{ color: C.taupe }} className="text-xs">
             {property.googleColorId ? `Couleur choisie : ${GCAL_COLORS.find((c) => c.id === property.googleColorId)?.name} — tape à nouveau dessus pour l'enlever.` : "Aucune couleur choisie : les ménages de ce logement garderont la couleur par défaut de l'agenda (sauf s'ils sont \"à attribuer\", toujours en violet)."}
           </p>
-        </div>
-      )}
-
-      {isOwner && (
-        <div className="mb-5">
-          <p style={{ color: C.ink }} className="text-sm font-semibold mb-2">Synchronisation réservations (Hostaway / iCal)</p>
-          <div className="flex gap-2 mb-2">
-            <input value={icalUrl} onChange={(e) => setIcalUrl(e.target.value)} onBlur={saveIcalUrl} placeholder="Lien iCal Hostaway (optionnel)" className="flex-1" style={selectStyle} />
-          </div>
-          <button onClick={runSync} disabled={!icalUrl.trim() || syncing} className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: C.linenSoft, color: C.ink }}>
-            {syncing ? <div className="animate-spin"><Icon name="loader" size={14} color={C.taupe} /></div> : <Icon name="calendar" size={14} color={C.taupe} />}
-            Synchroniser maintenant
-          </button>
-          <details className="mb-1">
-            <summary style={{ color: C.taupe }} className="text-xs cursor-pointer select-none">La synchronisation automatique ne fonctionne pas ? Coller le calendrier manuellement</summary>
-            <textarea value={icsPaste} onChange={(e) => setIcsPaste(e.target.value)} placeholder="Colle ici le contenu du fichier .ics (BEGIN:VCALENDAR...)" rows={3}
-              className="w-full px-3 py-2 rounded-xl text-xs outline-none mt-2 mb-2" style={{ background: C.linenSoft, color: C.ink, fontFamily: "'IBM Plex Mono', monospace" }} />
-            <button onClick={runPasteImport} disabled={!icsPaste.trim() || syncing} className="w-full py-2 rounded-xl text-xs font-medium disabled:opacity-50" style={{ background: C.ink, color: C.linen }}>
-              Importer ce texte
-            </button>
-          </details>
-          {syncMsg && <p style={{ color: C.sauge }} className="text-xs mt-2">{syncMsg}</p>}
-          <p style={{ color: C.taupe }} className="text-xs mt-2">Import des dates uniquement (pas le nom ni le téléphone du client) — à compléter à la main dans la fiche de chaque réservation si besoin.</p>
         </div>
       )}
 
@@ -3357,6 +3358,7 @@ function MediaExportSection({ profile, properties, cleanings }) {
   const [building, setBuilding] = useState(false);
   const [progress, setProgress] = useState(null);
   const [msg, setMsg] = useState("");
+  const [ready, setReady] = useState(null); // { blob, filename } : fichier prêt à partager
 
   if (profile.role !== "owner") return null;
 
@@ -3374,8 +3376,17 @@ function MediaExportSection({ profile, properties, cleanings }) {
     return { startISO: null, endISO: null, label: "tout" };
   };
 
+  // Le menu de partage ne peut s'ouvrir que dans un clic direct : la
+  // préparation du zip prend du temps, donc on prépare d'abord, puis on
+  // propose un bouton « Envoyer » qui ouvre le partage immédiatement.
+  const sendReady = async () => {
+    if (!ready) return;
+    const { blob, filename } = ready;
+    setReady(null);
+    await shareOrDownloadBlob(blob, filename, "application/zip");
+  };
   const run = async (mode) => {
-    setBuilding(true); setMsg(""); setProgress({ done: 0, total: 0 });
+    setBuilding(true); setMsg(""); setReady(null); setProgress({ done: 0, total: 0 });
     try {
       const { startISO, endISO, label } = scopeRange();
       const blob = await buildMediaExportZip({
@@ -3386,8 +3397,10 @@ function MediaExportSection({ profile, properties, cleanings }) {
         setMsg("Aucune photo ni vidéo trouvée pour cette période.");
       } else {
         const filename = `photos-videos-${label}-${todayISO()}.zip`.replace(/\s+/g, "-");
-        if (mode === "share") await shareOrDownloadBlob(blob, filename, "application/zip");
-        else downloadBlob(blob, filename);
+        if (mode === "share") {
+          setReady({ blob, filename });
+          setMsg(`Fichier prêt (${(blob.size / 1048576).toFixed(1)} Mo). Appuie sur « Envoyer » pour choisir WhatsApp, mail, etc.`);
+        } else downloadBlob(blob, filename);
       }
     } catch (e) {
       console.error("Erreur export médias :", e);
@@ -3430,7 +3443,13 @@ function MediaExportSection({ profile, properties, cleanings }) {
         {building && progress && progress.total > 0 && (
           <p style={{ color: C.taupe }} className="text-xs mt-2">Préparation… {progress.done}/{progress.total} missions</p>
         )}
-        {msg && <p style={{ color: C.terracotta }} className="text-xs mt-2">{msg}</p>}
+        {ready && (
+          <button onClick={sendReady} className="w-full mt-2 py-2.5 rounded-xl text-sm font-semibold flex items-center justify-center gap-2" style={{ background: C.sauge, color: "#fff" }}>
+            <Icon name="share" size={15} />
+            Envoyer le fichier
+          </button>
+        )}
+        {msg && <p style={{ color: ready ? C.sauge : C.terracotta }} className="text-xs mt-2">{msg}</p>}
         <p style={{ color: C.taupe }} className="text-xs mt-2">Les fichiers volumineux (beaucoup de vidéos) peuvent être trop lourds pour un envoi par mail — privilégie WhatsApp ou un service comme Drive si besoin.</p>
       </div>
     </div>
