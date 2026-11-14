@@ -503,21 +503,40 @@ function ensureDocxLoaded() {
 // dans le clic. On convertit donc les photos en fichiers sans aucune attente
 // (pas de fetch), puis on appelle navigator.share tout de suite. Avant, une
 // attente se glissait entre le clic et le partage et le téléphone refusait.
-function shareCleaningPhotos(photos, property) {
+function shareCleaningPhotos(photos, property, offset = 0) {
   if (!photos || photos.length === 0) return Promise.resolve({ ok: false, reason: "no-photos" });
   let files;
   try {
-    files = photos.map((src, i) => new File([dataURLtoBlob(src)], `menage-${property?.name || "logement"}-${i + 1}.jpg`.replace(/\s+/g, "-"), { type: "image/jpeg" }));
+    files = photos.map((src, i) => new File([dataURLtoBlob(src)], `menage-${photoFileBase(property)}-${offset + i + 1}.jpg`, { type: "image/jpeg" }));
   } catch (e) {
     return Promise.resolve({ ok: false, reason: "error", detail: e?.name || "" });
   }
   if (!navigator.share || !navigator.canShare || !navigator.canShare({ files })) {
     return Promise.resolve({ ok: false, reason: "not-supported" });
   }
+  // Fichiers seulement (pas de titre ni de texte) : certains téléphones et
+  // navigateurs refusent le partage quand on y ajoute du texte.
   return navigator
-    .share({ files, title: `Photos — ${property?.name || "logement"}`, text: `Photos du ménage — ${property?.name || "logement"}` })
+    .share({ files })
     .then(() => ({ ok: true }))
     .catch((e) => (e?.name === "AbortError" ? { ok: false, reason: "cancelled" } : { ok: false, reason: "error", detail: e?.name || "" }));
+}
+// Nom de fichier simple (sans accents ni caractères spéciaux), certains
+// navigateurs refusent les noms compliqués.
+function photoFileBase(property) {
+  return (property?.name || "logement").normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-zA-Z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40) || "logement";
+}
+// Repli fiable : télécharge toutes les photos du ménage dans un .zip
+// (aucune autorisation de partage nécessaire).
+async function downloadCleaningPhotosZip(photos, property, dateLabel) {
+  if (!window.JSZip) throw new Error("La bibliothèque zip n'est pas chargée. Vérifie ta connexion internet et recharge la page.");
+  const zip = new JSZip();
+  photos.forEach((src, i) => {
+    const base64 = src.split(",")[1] || "";
+    zip.file(`photo-${i + 1}.jpg`, base64, { base64: true });
+  });
+  const blob = await zip.generateAsync({ type: "blob" });
+  downloadBlob(blob, `photos-${photoFileBase(property)}-${dateLabel || todayISO()}.zip`);
 }
 
 /* ---------------------------------------------------------
@@ -2033,6 +2052,8 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
   const [reportMsg, setReportMsg] = useState("");
   const [sharing, setSharing] = useState(false);
   const [shareMsg, setShareMsg] = useState("");
+  const [sharePage, setSharePage] = useState(0);
+  const [zipping, setZipping] = useState(false);
 
   useEffect(() => {
     (async () => {
@@ -2228,20 +2249,44 @@ function CleaningDetail({ cleaning, property, properties, saveProperties, team, 
           <p style={{ color: C.taupe }} className="text-xs mb-2">Les photos sont visibles par toute l'équipe.</p>
           {photos.length > 0 && (
             <>
-              <button
-                onClick={async () => {
-                  setSharing(true); setShareMsg("");
-                  const res = await shareCleaningPhotos(photos, property);
-                  if (res.ok) setShareMsg("");
-                  else if (res.reason === "not-supported") setShareMsg("Le partage direct n'est pas disponible sur ce navigateur. Appuie longuement sur une photo pour l'enregistrer, puis partage-la manuellement.");
-                  else if (res.reason === "error") setShareMsg(`Le partage a échoué${res.detail ? ` (${res.detail})` : ""}. Réessaie ; avec beaucoup de photos, essaie d'en partager moins à la fois, ou utilise Statistiques → Exporter photos & vidéos.`);
-                  setSharing(false);
-                }}
-                disabled={sharing}
-                className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: C.linenSoft, color: C.ink }}>
-                {sharing ? <div className="animate-spin"><Icon name="loader" size={15} color={C.taupe} /></div> : <Icon name="share" size={15} color={C.taupe} />}
-                Partager les photos (WhatsApp, etc.)
-              </button>
+              {(() => {
+                const SHARE_CHUNK = 10; // les navigateurs limitent le nombre de fichiers par partage
+                const pages = Math.ceil(photos.length / SHARE_CHUNK);
+                const page = Math.min(sharePage, pages - 1);
+                const start = page * SHARE_CHUNK;
+                const end = Math.min(start + SHARE_CHUNK, photos.length);
+                const label = pages > 1 ? `Partager les photos ${start + 1} à ${end} sur ${photos.length}` : "Partager les photos (WhatsApp, etc.)";
+                return (
+                  <>
+                    <button
+                      onClick={async () => {
+                        setSharing(true); setShareMsg("");
+                        const res = await shareCleaningPhotos(photos.slice(start, end), property, start);
+                        if (res.ok) { if (pages > 1) setSharePage(page + 1 < pages ? page + 1 : 0); }
+                        else if (res.reason === "not-supported") setShareMsg("Le partage direct n'est pas disponible sur ce navigateur. Utilise « Télécharger les photos (zip) » ci-dessous.");
+                        else if (res.reason === "error") setShareMsg(`Le partage a été refusé par ton appareil${res.detail ? ` (${res.detail})` : ""}. Utilise « Télécharger les photos (zip) » ci-dessous, puis envoie le fichier depuis ton téléphone.`);
+                        setSharing(false);
+                      }}
+                      disabled={sharing}
+                      className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: C.linenSoft, color: C.ink }}>
+                      {sharing ? <div className="animate-spin"><Icon name="loader" size={15} color={C.taupe} /></div> : <Icon name="share" size={15} color={C.taupe} />}
+                      {label}
+                    </button>
+                    <button
+                      onClick={async () => {
+                        setZipping(true); setShareMsg("");
+                        try { await downloadCleaningPhotosZip(photos, property, cleaning.date); }
+                        catch (err) { setShareMsg(err?.message || "Le téléchargement a échoué. Réessaie."); }
+                        setZipping(false);
+                      }}
+                      disabled={zipping}
+                      className="w-full py-2.5 rounded-xl text-sm font-medium flex items-center justify-center gap-2 disabled:opacity-50 mb-2" style={{ background: "transparent", color: C.taupe, border: `1px solid ${C.taupeLight}` }}>
+                      {zipping ? <div className="animate-spin"><Icon name="loader" size={15} color={C.taupe} /></div> : <Icon name="download" size={15} color={C.taupe} />}
+                      Télécharger les photos (zip)
+                    </button>
+                  </>
+                );
+              })()}
               {shareMsg && <p style={{ color: C.terracotta }} className="text-xs mb-3">{shareMsg}</p>}
             </>
           )}
