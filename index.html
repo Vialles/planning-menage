@@ -2567,7 +2567,9 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
               </div>
               {/* lignes logements */}
               {properties.map((p) => {
-                const resForP = reservations.filter((r) => r.propertyId === p.id && r.checkOut > monthStartISO && r.checkIn <= monthEndISO);
+                // checkOut >= début du mois : un séjour qui part le 1er du mois doit rester
+                // visible ce mois-là (jour de départ, ménage, rotation du jour).
+                const resForP = reservations.filter((r) => r.propertyId === p.id && r.checkOut >= monthStartISO && r.checkIn <= monthEndISO);
                 // Jours de rotation : un client part ET un autre arrive le même
                 // jour sur ce logement — cas à repérer en priorité pour
                 // organiser le ménage (délai très serré entre les deux).
@@ -2603,13 +2605,16 @@ function OccupationTab({ profile, properties, reservations, saveReservations, cl
                         // le client part ce jour-là — utile pour repérer les jours
                         // de rotation entre deux séjours.
                         const departureVisible = r.checkOut <= monthEndISO && r.checkOut >= monthStartISO;
+                        const hasNightsThisMonth = endCol > startCol;
                         return (
                           <React.Fragment key={r.id}>
-                            <button onClick={() => setOpenId(r.id)}
-                              className="absolute top-2 rounded-md text-left px-1.5 flex items-center overflow-hidden"
-                              style={{ left: (startCol - 1) * dayW + 2, width: Math.max(dayW - 4, (endCol - startCol) * dayW - 4), height: 26, background: src.color }}>
-                              <span className="text-[10px] font-medium truncate" style={{ color: "#fff" }}>{r.guestName}</span>
-                            </button>
+                            {hasNightsThisMonth && (
+                              <button onClick={() => setOpenId(r.id)}
+                                className="absolute top-2 rounded-md text-left px-1.5 flex items-center overflow-hidden"
+                                style={{ left: (startCol - 1) * dayW + 2, width: Math.max(dayW - 4, (endCol - startCol) * dayW - 4), height: 26, background: src.color }}>
+                                <span className="text-[10px] font-medium truncate" style={{ color: "#fff" }}>{r.guestName}</span>
+                              </button>
+                            )}
                             {departureVisible && (
                               <div onClick={() => setOpenId(r.id)} title="Jour de départ"
                                 className="absolute top-2 rounded-md cursor-pointer"
